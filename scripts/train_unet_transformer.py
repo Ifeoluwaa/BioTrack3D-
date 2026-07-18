@@ -821,7 +821,8 @@ def train_epoch(
         voxel_size = tuple(batch["voxel_size"][0].tolist())
         ds_scale = batch["downsample"][0].to(device)                                   # (3,)
 
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         t1 = time.perf_counter()
         t_data += t1 - t0
 
@@ -881,7 +882,8 @@ def train_epoch(
         # --- 5. Combined loss -----------------------------------------------
         loss = edge_loss + det_loss_weight * det_loss
 
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         t2 = time.perf_counter()
         t_forward += t2 - t1
 
@@ -890,7 +892,8 @@ def train_epoch(
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         t3 = time.perf_counter()
         t_backward += t3 - t2
 
@@ -1119,9 +1122,18 @@ def train(
         generator=g, worker_init_fn=worker_init_fn,
     )
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    n_visible = torch.cuda.device_count() if device.type == "cuda" else 0
-    print(f"Using device: {device} | visible CUDA GPUs: {n_visible}", flush=True)
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    
+    print(f"Using device: {device}", flush=True)
+    if device.type == "cuda":
+        print(f"Visible CUDA GPUs: {torch.cuda.device_count()}", flush=True)
+    elif device.type == "mps":
+        print("Using Apple Metal Performance Shaders (MPS)", flush=True)
 
     unet = TemporalUNet3D(
         in_channels=1,
