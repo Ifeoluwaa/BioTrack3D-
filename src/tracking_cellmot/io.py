@@ -38,10 +38,11 @@ def open_dataset(ds_path: Path | str,
                 target_scale: tuple[float, float, float] | None = None,
                 normalize: bool = True,
                 gamma: float = 1.0,
-                device: str = "cuda",
+                device: str | None = None,
                 require_tracks: bool = False,
                 load_image: bool = True,
                 downsample: tuple[int, ...] | None = None) -> Dataset:
+
     """Open a dataset from a zarr file and optionally a geff tracks file.
 
     Parameters
@@ -69,6 +70,15 @@ def open_dataset(ds_path: Path | str,
         Dataset with image shape (T, Z, Y, X). When ``load_image=False``,
         ``image`` is None but ``image_shape`` and ``zarr_path`` are populated.
     """
+
+    if device is None:
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
+            
     ds_path = Path(ds_path)
     if ds_path.suffix in (".zarr", ".geff"):
         ds_path = ds_path.parent / ds_path.stem
@@ -196,7 +206,11 @@ def _process_on_gpu(
             q2 = np.float32(q2)
 
     # 2. Transfer raw float32 to GPU once (pinned memory for faster DMA)
-    tensor = torch.from_numpy(image).pin_memory().to(torch_device, non_blocking=True)
+    tensor = torch.from_numpy(image)
+    if torch_device.type == "cuda":
+        tensor = tensor.pin_memory().to(torch_device, non_blocking=True)
+    else:
+        tensor = tensor.to(torch_device)
 
     # 3. Apply normalization on GPU
     if normalize:

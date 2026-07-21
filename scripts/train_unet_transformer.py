@@ -12,6 +12,8 @@ Usage:
     uv run scripts/train_unet_transformer.py --split 0 --epochs 50
 """
 
+from _pytest import outcomes
+from networkx.generators import spectral_graph_forge
 import argparse
 import json
 import time
@@ -33,6 +35,11 @@ from tracking_cellmot.io import invert_time_graph, open_dataset
 from tracking_cellmot.models import SimpleNodeTransformer, TemporalUNet3D
 
 from itertools import cycle as _cycle
+
+
+def worker_init_fn(worker_id: int) -> None:
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
 
 
 def compute_gt_transition_matrix(
@@ -415,7 +422,7 @@ class UNetNodeTransformer(nn.Module):
 
     Forward pass:
       1. Stack frames t and t+1 → (B, 2, 1, *spatial) → UNet → (B, 2, C_feat, *spatial)
-      2. Integer-index feature maps at node coords (round + clamp; differentiable)
+      2. Extract node features from UNet feature maps
       3. Concatenate with sinusoidal positional embeddings
       4. Cross-attention transformer → (B, max_nodes, max_nodes) edge logits
     """
@@ -429,12 +436,19 @@ class UNetNodeTransformer(nn.Module):
         n_heads: int = 4,
         n_blocks: int = 4,
         dropout: float = 0.3,
+        pool_radius: int = 1,
     ):
         super().__init__()
+
         self.unet = unet
         self.unet_out_channels = unet_out_channels
+        self.pool_radius = pool_radius
 
-        self.detect_head = nn.Conv3d(unet_out_channels, 1, kernel_size=1)
+        self.detect_head = nn.Conv3d(
+            unet_out_channels,
+            1,
+            kernel_size=1,
+        )
 
         self.transformer = SimpleNodeTransformer(
             feat_dim=unet_out_channels + pos_feat_dim,
@@ -444,31 +458,169 @@ class UNetNodeTransformer(nn.Module):
             dropout=dropout,
         )
 
-    def _index_features(
+    def _extract_single_voxel(
         self,
-        feat_maps: torch.Tensor,  # (B, C, *spatial)
-        coords: torch.Tensor,     # (B, max_nodes, 3)
-        mask: torch.Tensor,       # (B, max_nodes) bool
+        feat_maps: torch.Tensor,
+        coords: torch.Tensor,
+        mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Integer-index feat_maps at node positions; padded slots → zeros.
+        """Original BioTrack3D++ feature extraction.
 
-        Gradients flow through the *feature map values* but NOT through the
-        coordinates (integer indexing is non-differentiable w.r.t. position).
+        Each node is represented by the UNet feature vector at a single
+        integer voxel location.
         """
         B, C = feat_maps.shape[:2]
         spatial = feat_maps.shape[2:]
         max_nodes = coords.shape[1]
 
-        out = torch.zeros(B, max_nodes, C, device=feat_maps.device, dtype=feat_maps.dtype)
+        out = torch.zeros(
+            B,
+            max_nodes,
+            C,
+            device=feat_maps.device,
+            dtype=feat_maps.dtype,
+        )
+
         for b in range(B):
             nt = int(mask[b].sum().item())
             if nt == 0:
                 continue
+
             z = coords[b, :nt, 0].long().clamp(0, spatial[0] - 1)
             y = coords[b, :nt, 1].long().clamp(0, spatial[1] - 1)
             x = coords[b, :nt, 2].long().clamp(0, spatial[2] - 1)
+
             out[b, :nt] = feat_maps[b, :, z, y, x].T
+
         return out
+
+    def _create_gaussian_kernel(
+        self,
+        radius: int,
+        sigma: float,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+    
+        """
+        Create a normalized 3D Gaussian kernel.
+
+        Returns
+        -------
+        Tensor of shape (K, K, K), where K = 2*radius + 1.
+        """
+
+        coords = torch.arange(
+            -radius,
+            radius + 1,
+            device=device,
+            dtype=dtype,
+        )
+
+        z, y, x = torch.meshgrid(
+            coords,
+            coords,
+            coords,
+            indexing="ij",
+        )
+
+        kernel = torch.exp(
+            -(x**2 + y**2 + z**2) / (2 * sigma**2)
+        )
+
+        kernel /= kernel.sum()
+
+        return kernel
+
+    def _extract_local_pool(
+        self,
+        feat_maps: torch.Tensor,
+        coords: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+
+        B, C, Z, Y, X = feat_maps.shape
+
+        pooled = feat_maps.new_zeros(B, coords.shape[1], C)
+
+        r = self.pool_radius
+
+        kernel = self._create_gaussian_kernel(
+            radius=r,
+            sigma=max(r / 2, 0.75),
+            device=feat_maps.device,
+            dtype=feat_maps.dtype,
+        )
+
+        for b in range(B):
+            for n in range(coords.shape[1]):
+
+                if not mask[b, n]:
+                    continue
+
+                z = int(torch.round(coords[b, n, 0]).item())
+                y = int(torch.round(coords[b, n, 1]).item())
+                x = int(torch.round(coords[b, n, 2]).item())
+
+                z = max(0, min(z, Z - 1))
+                y = max(0, min(y, Y - 1))
+                x = max(0, min(x, X - 1))
+
+                z0 = max(0, z - r)
+                z1 = min(Z, z + r + 1)
+
+                y0 = max(0, y - r)
+                y1 = min(Y, y + r + 1)
+
+                x0 = max(0, x - r)
+                x1 = min(X, x + r + 1)
+
+                patch = feat_maps[b, :, z0:z1, y0:y1, x0:x1]
+
+                kz0 = r - (z - z0)
+                ky0 = r - (y - y0)
+                kx0 = r - (x - x0)
+
+                kz1 = kz0 + patch.shape[1]
+                ky1 = ky0 + patch.shape[2]
+                kx1 = kx0 + patch.shape[3]
+
+            weight = kernel[kz0:kz1, ky0:ky1, kx0:kx1]
+
+            weight = weight / weight.sum()
+
+            pooled[b, n] = (
+                patch * weight.unsqueeze(0)
+            ).sum(dim=(1, 2, 3))
+
+        return pooled
+    
+    def _index_features(
+        self,
+        feat_maps: torch.Tensor,
+        coords: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Extract node features from the UNet feature map.
+
+        pool_radius = 0:
+            Original single-voxel indexing.
+
+        pool_radius > 0:
+            Local Feature Pooling (to be implemented).
+        """
+
+        if self.pool_radius == 0:
+            return self._extract_single_voxel(
+                feat_maps,
+                coords,
+                mask,
+            )
+        return self._extract_local_pool(
+            feat_maps,
+            coords,
+            mask,
+        )
 
     def detect(
         self,
@@ -1100,26 +1252,24 @@ def train(
     train_ds = FrameWindowDataset(train_video_data, max_nodes=max_nodes, augmentations=augmentations)
     test_ds = FrameWindowDataset(test_video_data, max_nodes=max_nodes)
     g = None
-    worker_init_fn = None
+    init_fn = None
     if seed is not None:
         g = torch.Generator()
         g.manual_seed(seed)
+        init_fn = worker_init_fn
 
-        def worker_init_fn(worker_id: int) -> None:
-            worker_seed = torch.initial_seed() % 2**32
-            np.random.seed(worker_seed)
-
+    
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
         num_workers=num_workers, prefetch_factor=2 if num_workers > 0 else None,
         persistent_workers=num_workers > 0, pin_memory=False,
-        generator=g, worker_init_fn=worker_init_fn,
+        generator=g, worker_init_fn=init_fn,
     )
     test_loader = DataLoader(
         test_ds, batch_size=batch_size, shuffle=False,
         num_workers=num_workers, prefetch_factor=2 if num_workers > 0 else None,
         persistent_workers=num_workers > 0, pin_memory=False,
-        generator=g, worker_init_fn=worker_init_fn,
+        generator=g, worker_init_fn=init_fn,
     )
 
     if torch.cuda.is_available():
