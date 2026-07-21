@@ -436,13 +436,15 @@ class UNetNodeTransformer(nn.Module):
         n_heads: int = 4,
         n_blocks: int = 4,
         dropout: float = 0.3,
-        pool_radius: int = 1,
+        pool_radius: int = 0,
+        pool_sigma: float | None = None,
     ):
         super().__init__()
 
         self.unet = unet
         self.unet_out_channels = unet_out_channels
         self.pool_radius = pool_radius
+        self.pool_sigma = pool_sigma if pool_sigma is not None else max(pool_radius / 2, 0.75)
 
         self.detect_head = nn.Conv3d(
             unet_out_channels,
@@ -501,15 +503,7 @@ class UNetNodeTransformer(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-    
-        """
-        Create a normalized 3D Gaussian kernel.
-
-        Returns
-        -------
-        Tensor of shape (K, K, K), where K = 2*radius + 1.
-        """
-
+        """Create a normalized 3D Gaussian kernel."""
         coords = torch.arange(
             -radius,
             radius + 1,
@@ -538,7 +532,6 @@ class UNetNodeTransformer(nn.Module):
         coords: torch.Tensor,
         mask: torch.Tensor,
     ) -> torch.Tensor:
-
         B, C, Z, Y, X = feat_maps.shape
 
         pooled = feat_maps.new_zeros(B, coords.shape[1], C)
@@ -547,7 +540,7 @@ class UNetNodeTransformer(nn.Module):
 
         kernel = self._create_gaussian_kernel(
             radius=r,
-            sigma=max(r / 2, 0.75),
+            sigma=self.pool_sigma,
             device=feat_maps.device,
             dtype=feat_maps.dtype,
         )
@@ -585,13 +578,12 @@ class UNetNodeTransformer(nn.Module):
                 ky1 = ky0 + patch.shape[2]
                 kx1 = kx0 + patch.shape[3]
 
-            weight = kernel[kz0:kz1, ky0:ky1, kx0:kx1]
+                weight = kernel[kz0:kz1, ky0:ky1, kx0:kx1]
+                weight = weight / weight.sum()
 
-            weight = weight / weight.sum()
-
-            pooled[b, n] = (
-                patch * weight.unsqueeze(0)
-            ).sum(dim=(1, 2, 3))
+                pooled[b, n] = (
+                    patch * weight.unsqueeze(0)
+                ).sum(dim=(1, 2, 3))
 
         return pooled
     
@@ -1176,6 +1168,8 @@ def train(
     augmentations: list | None = DEFAULT_AUGMENTATIONS,
     pool_kernel_um: float = 5.0,
     data_parallel: bool = True,
+    pool_radius: int = 0,
+    pool_sigma: float | None = None,
 ) -> UNetNodeTransformer:
     """Train on one fold from a pre-computed splits file.
 
@@ -1220,6 +1214,8 @@ def train(
         "downsample": list(downsample),
         "window_size": window_size,
         "pool_kernel_um": pool_kernel_um,
+        "pool_radius": pool_radius,
+        "pool_sigma": pool_sigma,
     }
     (output_dir / "config.json").write_text(json.dumps(model_config, indent=2))
 
@@ -1299,6 +1295,8 @@ def train(
         unet=unet,
         unet_out_channels=unet_out_channels,
         pos_feat_dim=pos_feat_dim,
+        pool_radius=pool_radius,
+        pool_sigma=pool_sigma,
     ).to(device)
 
     # Simple multi-GPU: split the heavy UNet pass across all visible GPUs.

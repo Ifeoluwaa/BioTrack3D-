@@ -192,6 +192,8 @@ def load_model(
         unet=unet,
         unet_out_channels=config["unet_out_channels"],
         pos_feat_dim=4 * _POS_EMBED_DIM,
+        pool_radius=config.get("pool_radius", 0),
+        pool_sigma=config.get("pool_sigma", None),
     )
     state = torch.load(weights_path, map_location=device, weights_only=True)
     model.load_state_dict(state)
