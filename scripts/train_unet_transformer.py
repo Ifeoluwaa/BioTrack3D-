@@ -12,6 +12,7 @@ Usage:
     uv run scripts/train_unet_transformer.py --split 0 --epochs 50
 """
 
+from polars import fold
 from _pytest import outcomes
 from networkx.generators import spectral_graph_forge
 import argparse
@@ -417,15 +418,189 @@ def load_dataset_windows(
 # Model
 # =============================================================================
 
-class UNetNodeTransformer(nn.Module):
-    """TemporalUNet3D encoder + SimpleNodeTransformer edge predictor.
+class LCAPv1(nn.Module):
+    """Minimal Local Cross-Attention Pooling (LCAP-v1).
 
-    Forward pass:
-      1. Stack frames t and t+1 → (B, 2, 1, *spatial) → UNet → (B, 2, C_feat, *spatial)
-      2. Extract node features from UNet feature maps
-      3. Concatenate with sinusoidal positional embeddings
-      4. Cross-attention transformer → (B, max_nodes, max_nodes) edge logits
+    Extracts a 3x3x3 local feature neighborhood around each node, applies
+    single-head scaled dot-product attention using the center voxel as Query,
+    and combines the attended context with the center voxel using a learnable
+    zero-initialized gate gamma.
     """
+
+    def __init__(self, in_channels: int, attn_dim: int | None = None):
+        super().__init__()
+        self.in_channels = in_channels
+        self.attn_dim = attn_dim if attn_dim is not None else max(1, in_channels // 2)
+
+        self.w_q = nn.Linear(in_channels, self.attn_dim, bias=False)
+        self.w_k = nn.Linear(in_channels, self.attn_dim, bias=False)
+        self.w_v = nn.Linear(in_channels, in_channels, bias=False)
+
+        self.gamma = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+        self.last_attn_weights: torch.Tensor | None = None
+
+    def forward(
+        self,
+        feat_maps: torch.Tensor,  # (B, C, Z, Y, X)
+        coords: torch.Tensor,     # (B, N, 3)
+        mask: torch.Tensor,       # (B, N)
+    ) -> torch.Tensor:
+        B, C, Z, Y, X = feat_maps.shape
+        N = coords.shape[1]
+
+        out = feat_maps.new_zeros(B, N, C)
+        attn_list = []
+
+        for b in range(B):
+            nt = int(mask[b].sum().item())
+            if nt == 0:
+                continue
+
+            zc = torch.round(coords[b, :nt, 0]).long().clamp(0, Z - 1)
+            yc = torch.round(coords[b, :nt, 1]).long().clamp(0, Y - 1)
+            xc = torch.round(coords[b, :nt, 2]).long().clamp(0, X - 1)
+
+            # Center voxel features (nt, C)
+            f_center = feat_maps[b, :, zc, yc, xc].T
+
+            # Extract 27-neighborhood features for each node (nt, 27, C)
+            nbd_feats = feat_maps.new_zeros(nt, 27, C)
+            idx = 0
+            for dz in (-1, 0, 1):
+                zn = (zc + dz).clamp(0, Z - 1)
+                for dy in (-1, 0, 1):
+                    yn = (yc + dy).clamp(0, Y - 1)
+                    for dx in (-1, 0, 1):
+                        xn = (xc + dx).clamp(0, X - 1)
+                        nbd_feats[:, idx] = feat_maps[b, :, zn, yn, xn].T
+                        idx += 1
+
+            # Projections
+            Q = self.w_q(f_center).unsqueeze(1)    # (nt, 1, d_k)
+            K = self.w_k(nbd_feats)                 # (nt, 27, d_k)
+            V = self.w_v(nbd_feats)                 # (nt, 27, C)
+
+            # Scaled Dot-Product Attention
+            scores = torch.bmm(Q, K.transpose(1, 2)) / (self.attn_dim ** 0.5)  # (nt, 1, 27)
+            attn_weights = F.softmax(scores, dim=-1)                             # (nt, 1, 27)
+            attn_list.append(attn_weights.squeeze(1))
+
+            f_attn = torch.bmm(attn_weights, V).squeeze(1)                       # (nt, C)
+
+            # Residual Gated Sum: f_out = f_center + gamma * f_attn
+            out[b, :nt] = f_center + self.gamma * f_attn
+
+        if attn_list:
+            self.last_attn_weights = torch.cat(attn_list, dim=0).detach()
+
+        return out
+
+
+class LCAPv2(nn.Module):
+    """Local Cross-Attention Pooling with 3D Relative Positional Encoding (LCAP-v2).
+
+    Extends LCAP-v1 by injecting relative physical 3D coordinate distance
+    embeddings into the Key projections via a lightweight MLP:
+        R_i = MLP(dz * s_z, dy * s_y, dx * s_x)
+        K_i = W_k(f_i) + R_i
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        attn_dim: int | None = None,
+        voxel_spacing: tuple[float, float, float] = (1.625, 0.40625, 0.40625),
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.attn_dim = attn_dim if attn_dim is not None else max(1, in_channels // 2)
+        self.voxel_spacing = voxel_spacing
+
+        self.w_q = nn.Linear(in_channels, self.attn_dim, bias=False)
+        self.w_k = nn.Linear(in_channels, self.attn_dim, bias=False)
+        self.w_v = nn.Linear(in_channels, in_channels, bias=False)
+
+        # Relative 3D Positional Encoder MLP: (3 -> 16 -> d_k)
+        self.pos_mlp = nn.Sequential(
+            nn.Linear(3, 16),
+            nn.ReLU(),
+            nn.Linear(16, self.attn_dim),
+        )
+
+        self.gamma = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+        self.last_attn_weights: torch.Tensor | None = None
+
+        # Precompute physical relative offsets for the 27 neighbors: (27, 3)
+        sz, sy, sx = voxel_spacing
+        rel_coords = []
+        for dz in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    rel_coords.append([dz * sz, dy * sy, dx * sx])
+        self.register_buffer("rel_coords", torch.tensor(rel_coords, dtype=torch.float32))
+
+    def forward(
+        self,
+        feat_maps: torch.Tensor,  # (B, C, Z, Y, X)
+        coords: torch.Tensor,     # (B, N, 3)
+        mask: torch.Tensor,       # (B, N)
+    ) -> torch.Tensor:
+        B, C, Z, Y, X = feat_maps.shape
+        N = coords.shape[1]
+
+        out = feat_maps.new_zeros(B, N, C)
+        attn_list = []
+
+        # Compute relative positional embeddings R: (27, d_k)
+        R = self.pos_mlp(self.rel_coords)  # (27, d_k)
+
+        for b in range(B):
+            nt = int(mask[b].sum().item())
+            if nt == 0:
+                continue
+
+            zc = torch.round(coords[b, :nt, 0]).long().clamp(0, Z - 1)
+            yc = torch.round(coords[b, :nt, 1]).long().clamp(0, Y - 1)
+            xc = torch.round(coords[b, :nt, 2]).long().clamp(0, X - 1)
+
+            # Center voxel features (nt, C)
+            f_center = feat_maps[b, :, zc, yc, xc].T
+
+            # Extract 27-neighborhood features for each node (nt, 27, C)
+            nbd_feats = feat_maps.new_zeros(nt, 27, C)
+            idx = 0
+            for dz in (-1, 0, 1):
+                zn = (zc + dz).clamp(0, Z - 1)
+                for dy in (-1, 0, 1):
+                    yn = (yc + dy).clamp(0, Y - 1)
+                    for dx in (-1, 0, 1):
+                        xn = (xc + dx).clamp(0, X - 1)
+                        nbd_feats[:, idx] = feat_maps[b, :, zn, yn, xn].T
+                        idx += 1
+
+            # Projections
+            Q = self.w_q(f_center).unsqueeze(1)               # (nt, 1, d_k)
+            K = self.w_k(nbd_feats) + R.unsqueeze(0)           # (nt, 27, d_k) with Relative Positional Encoding
+            V = self.w_v(nbd_feats)                            # (nt, 27, C)
+
+            # Scaled Dot-Product Attention
+            scores = torch.bmm(Q, K.transpose(1, 2)) / (self.attn_dim ** 0.5)  # (nt, 1, 27)
+            attn_weights = F.softmax(scores, dim=-1)                             # (nt, 1, 27)
+            attn_list.append(attn_weights.squeeze(1))
+
+            f_attn = torch.bmm(attn_weights, V).squeeze(1)                       # (nt, C)
+
+            # Residual Gated Sum: f_out = f_center + gamma * f_attn
+            out[b, :nt] = f_center + self.gamma * f_attn
+
+        if attn_list:
+            self.last_attn_weights = torch.cat(attn_list, dim=0).detach()
+
+        return out
+
+
+class UNetNodeTransformer(nn.Module):
+    """TemporalUNet3D encoder + SimpleNodeTransformer edge predictor."""
 
     def __init__(
         self,
@@ -436,15 +611,27 @@ class UNetNodeTransformer(nn.Module):
         n_heads: int = 4,
         n_blocks: int = 4,
         dropout: float = 0.3,
+        pooling_mode: str = "single_voxel",
         pool_radius: int = 0,
         pool_sigma: float | None = None,
+        attn_dim: int | None = None,
+        voxel_spacing: tuple[float, float, float] = (1.625, 0.40625, 0.40625),
     ):
         super().__init__()
 
         self.unet = unet
         self.unet_out_channels = unet_out_channels
+        self.pooling_mode = pooling_mode
         self.pool_radius = pool_radius
         self.pool_sigma = pool_sigma if pool_sigma is not None else max(pool_radius / 2, 0.75)
+        self.voxel_spacing = voxel_spacing
+
+        if pooling_mode == "lcap_v1":
+            self.lcap = LCAPv1(in_channels=unet_out_channels, attn_dim=attn_dim)
+        elif pooling_mode == "lcap_v2":
+            self.lcap = LCAPv2(in_channels=unet_out_channels, attn_dim=attn_dim, voxel_spacing=voxel_spacing)
+        else:
+            self.lcap = None
 
         self.detect_head = nn.Conv3d(
             unet_out_channels,
@@ -536,11 +723,11 @@ class UNetNodeTransformer(nn.Module):
 
         pooled = feat_maps.new_zeros(B, coords.shape[1], C)
 
-        r = self.pool_radius
+        r = self.pool_radius if self.pool_radius > 0 else 1
 
         kernel = self._create_gaussian_kernel(
             radius=r,
-            sigma=self.pool_sigma,
+            sigma=self.pool_sigma if self.pooling_mode == "gaussian_pool" else 1e5,
             device=feat_maps.device,
             dtype=feat_maps.dtype,
         )
@@ -593,26 +780,13 @@ class UNetNodeTransformer(nn.Module):
         coords: torch.Tensor,
         mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Extract node features from the UNet feature map.
-
-        pool_radius = 0:
-            Original single-voxel indexing.
-
-        pool_radius > 0:
-            Local Feature Pooling (to be implemented).
-        """
-
-        if self.pool_radius == 0:
-            return self._extract_single_voxel(
-                feat_maps,
-                coords,
-                mask,
-            )
-        return self._extract_local_pool(
-            feat_maps,
-            coords,
-            mask,
-        )
+        """Extract node features from the UNet feature map according to pooling_mode."""
+        if self.pooling_mode in ("lcap_v1", "lcap_v2"):
+            return self.lcap(feat_maps, coords, mask)
+        elif self.pooling_mode in ("uniform_pool", "gaussian_pool"):
+            return self._extract_local_pool(feat_maps, coords, mask)
+        else:
+            return self._extract_single_voxel(feat_maps, coords, mask)
 
     def detect(
         self,
@@ -1168,8 +1342,11 @@ def train(
     augmentations: list | None = DEFAULT_AUGMENTATIONS,
     pool_kernel_um: float = 5.0,
     data_parallel: bool = True,
+    pooling_mode: str = "single_voxel",
     pool_radius: int = 0,
     pool_sigma: float | None = None,
+    attn_dim: int | None = None,
+    output_dir: Path | None = None,
 ) -> UNetNodeTransformer:
     """Train on one fold from a pre-computed splits file.
 
@@ -1204,7 +1381,12 @@ def train(
         test_files = [data_dir / name for name in fold_data["test"]]
         print(f"Fold {fold}: {len(train_files)} train, {len(test_files)} test", flush=True)
 
-    output_dir = WEIGHTS_PATH / method / f"split_{fold}"
+    if output_dir is None:
+        experiment_name = f"{method}_{pooling_mode}"
+        output_dir = WEIGHTS_PATH / experiment_name / f"split_{fold}"
+    else:
+        output_dir = Path(output_dir)
+
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Save arch config so predict_unet_transformer can reconstruct the model.
@@ -1214,8 +1396,10 @@ def train(
         "downsample": list(downsample),
         "window_size": window_size,
         "pool_kernel_um": pool_kernel_um,
+        "pooling_mode": pooling_mode,
         "pool_radius": pool_radius,
         "pool_sigma": pool_sigma,
+        "attn_dim": attn_dim,
     }
     (output_dir / "config.json").write_text(json.dumps(model_config, indent=2))
 
@@ -1295,8 +1479,10 @@ def train(
         unet=unet,
         unet_out_channels=unet_out_channels,
         pos_feat_dim=pos_feat_dim,
+        pooling_mode=pooling_mode,
         pool_radius=pool_radius,
         pool_sigma=pool_sigma,
+        attn_dim=attn_dim,
     ).to(device)
 
     # Simple multi-GPU: split the heavy UNet pass across all visible GPUs.
@@ -1412,6 +1598,18 @@ def main() -> None:
                              "when more than one is available (default: on).")
     parser.add_argument("--single-gpu", dest="data_parallel", action="store_false",
                         help="Disable multi-GPU; train on cuda:0 only.")
+    parser.add_argument("--pooling-mode", type=str, default="single_voxel",
+                        help="Feature aggregation mode: single_voxel, uniform_pool, gaussian_pool, lcap_v1, lcap_v2.")
+    parser.add_argument("--pool-radius", type=int, default=0,
+                        help="Radius for uniform or Gaussian pooling.")
+    parser.add_argument("--pool-sigma", type=float, default=None,
+                        help="Sigma for Gaussian pooling.")
+    parser.add_argument("--attn-dim", type=int, default=None,
+                        help="Attention projection dimensions for LCAP.")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Random seed for reproducibility.")
+    parser.add_argument("--output-dir", type=str, default="weights/unet_transformer",
+                        help="Directory to save checkpoint files.")
 
     args = parser.parse_args()
 
@@ -1447,6 +1645,12 @@ def main() -> None:
             window_size=args.window_size,
             pool_kernel_um=args.pool_kernel_um,
             data_parallel=args.data_parallel,
+            pooling_mode=args.pooling_mode,
+            pool_radius=args.pool_radius,
+            pool_sigma=args.pool_sigma,
+            attn_dim=args.attn_dim,
+            seed=args.seed,
+            
         )
 
 
