@@ -516,9 +516,6 @@ class LCAPv2(nn.Module):
         self.attn_dim = attn_dim if attn_dim is not None else max(1, in_channels // 2)
         self.voxel_spacing = voxel_spacing
 
-        # Cache Gaussian kernel
-        self._gaussian_kernel = None
-
         self.w_q = nn.Linear(in_channels, self.attn_dim, bias=False)
         self.w_k = nn.Linear(in_channels, self.attn_dim, bias=False)
         self.w_v = nn.Linear(in_channels, in_channels, bias=False)
@@ -629,9 +626,6 @@ class UNetNodeTransformer(nn.Module):
         self.pool_sigma = pool_sigma if pool_sigma is not None else max(pool_radius / 2, 0.75)
         self.voxel_spacing = voxel_spacing
 
-        # Cache Gaussian kernel
-        self._gaussian_kernel = None
-
         if pooling_mode == "lcap_v1":
             self.lcap = LCAPv1(in_channels=unet_out_channels, attn_dim=attn_dim)
         elif pooling_mode == "lcap_v2":
@@ -719,55 +713,67 @@ class UNetNodeTransformer(nn.Module):
 
         return kernel
 
-
     def _extract_local_pool(
         self,
         feat_maps: torch.Tensor,
         coords: torch.Tensor,
         mask: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Fast Gaussian / Uniform pooling.
+        B, C, Z, Y, X = feat_maps.shape
 
-        Blur the feature map once using depthwise Conv3D, then
-        use the existing single-voxel indexing.
-        """
+        pooled = feat_maps.new_zeros(B, coords.shape[1], C)
 
-        r = max(self.pool_radius, 1)
+        r = self.pool_radius if self.pool_radius > 0 else 1
 
-        if (
-            self._gaussian_kernel is None
-            or self._gaussian_kernel.device != feat_maps.device
-            or self._gaussian_kernel.dtype != feat_maps.dtype
-        ):
-            self._gaussian_kernel = self._create_gaussian_kernel(
-                radius=r,
-                sigma=self.pool_sigma if self.pooling_mode == "gaussian_pool" else 1e5,
-                device=feat_maps.device,
-                dtype=feat_maps.dtype,
-            )
-
-        kernel = self._gaussian_kernel.unsqueeze(0).unsqueeze(0)
-
-        kernel = kernel.expand(
-            feat_maps.shape[1],
-            1,
-            *kernel.shape[-3:]
-        ).contiguous()
-
-        blurred = F.conv3d(
-            feat_maps,
-            kernel,
-            padding=r,
-            groups=feat_maps.shape[1],
+        kernel = self._create_gaussian_kernel(
+            radius=r,
+            sigma=self.pool_sigma if self.pooling_mode == "gaussian_pool" else 1e5,
+            device=feat_maps.device,
+            dtype=feat_maps.dtype,
         )
 
-        return self._extract_single_voxel(
-            blurred,
-            coords,
-            mask,
-        )
+        for b in range(B):
+            for n in range(coords.shape[1]):
 
+                if not mask[b, n]:
+                    continue
+
+                z = int(torch.round(coords[b, n, 0]).item())
+                y = int(torch.round(coords[b, n, 1]).item())
+                x = int(torch.round(coords[b, n, 2]).item())
+
+                z = max(0, min(z, Z - 1))
+                y = max(0, min(y, Y - 1))
+                x = max(0, min(x, X - 1))
+
+                z0 = max(0, z - r)
+                z1 = min(Z, z + r + 1)
+
+                y0 = max(0, y - r)
+                y1 = min(Y, y + r + 1)
+
+                x0 = max(0, x - r)
+                x1 = min(X, x + r + 1)
+
+                patch = feat_maps[b, :, z0:z1, y0:y1, x0:x1]
+
+                kz0 = r - (z - z0)
+                ky0 = r - (y - y0)
+                kx0 = r - (x - x0)
+
+                kz1 = kz0 + patch.shape[1]
+                ky1 = ky0 + patch.shape[2]
+                kx1 = kx0 + patch.shape[3]
+
+                weight = kernel[kz0:kz1, ky0:ky1, kx0:kx1]
+                weight = weight / weight.sum()
+
+                pooled[b, n] = (
+                    patch * weight.unsqueeze(0)
+                ).sum(dim=(1, 2, 3))
+
+        return pooled
+    
     def _index_features(
         self,
         feat_maps: torch.Tensor,
@@ -1507,8 +1513,16 @@ def train(
 
     save_path = output_dir / "edge_predictor_best.pth"
 
-    start_epoch = 0
-    best_score = 0.0
+    if args.resume is not None:
+        checkpoint = torch.load(args.resume, map_location=device)
+
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+        start_epoch = checkpoint["epoch"] + 1
+        best_score = checkpoint["best_score"]
+
+        print(f"Resuming from epoch {start_epoch}", flush=True)
 
     print(f"Starting training for {n_epochs} epochs (batch_size={batch_size})...", flush=True)
 
