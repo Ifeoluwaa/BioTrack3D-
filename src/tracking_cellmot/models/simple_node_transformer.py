@@ -87,15 +87,82 @@ class SimpleNodeTransformer(nn.Module):
 
         self.norm_out = nn.LayerNorm(hidden_dim)
 
-        # MLP for pairwise scoring: concatenated features + relative position
+        # MLP for pairwise scoring: concatenated features (q, k, |q-k|, rel_xyz, dist, dist^2, dir_xyz, cos_sim)
+        pair_in_dim = hidden_dim * 3 + 9
         self.pair_mlp = nn.Sequential(
-            nn.Linear(hidden_dim * 2 + 3, hidden_dim),
+            nn.Linear(pair_in_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.GELU(),
             nn.Linear(hidden_dim // 2, 1),
         )
+
+    def _build_pair_features(
+        self,
+        qc: torch.Tensor,
+        kk: torch.Tensor,
+        cc: torch.Tensor,
+        cc1: torch.Tensor,
+        eps: float = 1e-8,
+    ) -> torch.Tensor:
+        """Construct the complete pairwise feature representation.
+
+        Parameters
+        ----------
+        qc : torch.Tensor
+            Query features, shape (B, N_c, H).
+        kk : torch.Tensor
+            Key features, shape (B, N_t1, H).
+        cc : torch.Tensor
+            Query coordinates, shape (B, N_c, 3).
+        cc1 : torch.Tensor
+            Key coordinates, shape (B, N_t1, 3).
+        eps : float
+            Small epsilon for numerical stability.
+
+        Returns
+        -------
+        torch.Tensor
+            Pairwise features, shape (B, N_c, N_t1, 3 * H + 9).
+        """
+        nc_i = qc.shape[1]
+        n1 = kk.shape[1]
+
+        # Expand q and k to (B, N_c, N_t1, H)
+        qe = qc.unsqueeze(2).expand(-1, -1, n1, -1)
+        ke = kk.unsqueeze(1).expand(-1, nc_i, -1, -1)
+
+        # Absolute embedding difference
+        abs_diff = torch.abs(qe - ke)
+
+        # Raw coordinate displacement
+        raw_delta = cc.unsqueeze(2) - cc1.unsqueeze(1)
+
+        # Euclidean distance and squared distance (computed from raw_delta)
+        distance_sq = torch.sum(raw_delta ** 2, dim=-1, keepdim=True)
+        distance = torch.sqrt(distance_sq + 1e-12)
+
+        # Unit direction vector (computed from raw_delta)
+        direction = raw_delta / (distance + eps)
+
+        # Scaled relative displacement passed to MLP
+        scaled_delta = raw_delta / 100.0
+
+        # Cosine similarity of q and k
+        cos_similarity = F.cosine_similarity(qe, ke, dim=-1).unsqueeze(-1)
+
+        # Concatenate features along the channel dimension
+        return torch.cat([
+            qe,
+            ke,
+            abs_diff,
+            scaled_delta,
+            distance,
+            distance_sq,
+            direction,
+            cos_similarity
+        ], dim=-1)
 
     def forward(
         self,
@@ -167,8 +234,8 @@ class SimpleNodeTransformer(nn.Module):
         k = self.norm_out(k)  # (B, N_t1, hidden)
 
         # Build pairwise logits in chunks over N_t to avoid O(N²) peak allocation.
-        # Full tensor (B, N_t, N_t1, 2*hidden+3) can be tens of GB for large N.
-        # Each chunk is grad-checkpointed: forward peak = B×chunk×N_t1×(2H+3),
+        # Full tensor can be tens of GB for large N.
+        # Each chunk is grad-checkpointed: forward peak = B×chunk×N_t1×(3H+9),
         # backward only re-stores tiny q_c / coords slice instead of all activations.
         N_t = q.shape[1]
         chunk = self.pair_chunk_size or N_t
@@ -185,13 +252,10 @@ class SimpleNodeTransformer(nn.Module):
                 cc: torch.Tensor,
                 cc1: torch.Tensor,
                 _pm: nn.Module = pair_mlp,
+                _bf = self._build_pair_features,
             ) -> torch.Tensor:
-                nc_i = qc.shape[1]
-                n1 = kk.shape[1]
-                qe = qc.unsqueeze(2).expand(-1, -1, n1, -1)
-                ke = kk.unsqueeze(1).expand(-1, nc_i, -1, -1)
-                rel = (cc.unsqueeze(2) - cc1.unsqueeze(1)) / 100.0
-                return _pm(torch.cat([qe, ke, rel], dim=-1)).squeeze(-1)
+                pair_features = _bf(qc, kk, cc, cc1)
+                return _pm(pair_features).squeeze(-1)
 
             if torch.is_grad_enabled():
                 out = grad_ckpt(
