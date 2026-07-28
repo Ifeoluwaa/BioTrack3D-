@@ -198,12 +198,14 @@ def load_model(
         attn_dim=config.get("attn_dim", None),
     )
     state = torch.load(weights_path, map_location=device, weights_only=True)
-    model.load_state_dict(state)
-    model.to(device)
+
+    missing, unexpected = model.load_state_dict(state, strict=False)
+
+    print("Missing keys:", missing)
+    print("Unexpected keys:", unexpected)
+    model = model.to(device)
     model.eval()
     return model, config["window_size"], downsample
-
-
 # =============================================================================
 # Per-frame loading
 # =============================================================================
@@ -287,6 +289,14 @@ def _detect_cells_pooled(
     pad = tuple(k // 2 for k in pool_kernel)
     pooled = F.max_pool3d(logits, pool_kernel, stride=1, padding=pad)
     is_peak = (logits == pooled) & (torch.sigmoid(logits) > det_threshold)
+    probs = torch.sigmoid(logits)
+    print(
+        f"max={probs.max().item():.4f}, "
+        f"mean={probs.mean().item():.4f}, "
+        f">0.99={(probs > 0.99).sum().item()}, "
+        f">0.95={(probs > 0.95).sum().item()}, "
+        f">0.50={(probs > 0.50).sum().item()}"
+)
     peak_idx = torch.nonzero(is_peak[0, 0])  # (N, 3)
 
     if peak_idx.shape[0] == 0:
@@ -399,6 +409,7 @@ def predict_video(
                 arr = _detect_cells_pooled(
                     det_logits[f_idx][0], t, cfg.det_threshold, pool_k,
                 )
+                print(f"Frame {t}: {len(arr)} detections")
                 coord_offset[t] = (global_node_count, global_node_count + len(arr))
                 global_node_count += len(arr)
                 coord_lists.append(arr)
@@ -522,8 +533,34 @@ def predict(
         test_names = [debug_video.name]
         data_dir = debug_video.parent
     else:
-        folds = json.loads(splits_file.read_text())
+        if splits_file.exists():
+            folds = json.loads(splits_file.read_text())
+        else:
+            import random
+
+            stems = sorted(
+                p.name[:-5]
+                for p in data_dir.glob("*.zarr")
+                if (data_dir / f"{p.name[:-5]}.geff").exists()
+            )
+
+            random.Random(0).shuffle(stems)
+            n_val = max(1, len(stems) // 10)
+
+            folds = [{
+                "split": 0,
+                "train": stems[n_val:],
+                "test": stems[:n_val],
+            }]
+
+            print(
+                f"No splits file at {splits_file}; "
+                f"generated seed-0 split ({len(stems)-n_val} train / {n_val} val).",
+                flush=True,
+            )
+
         test_names = folds[fold]["test"]
+
         if video_slice is not None:
             test_names = test_names[video_slice]
 
@@ -542,7 +579,13 @@ def predict(
     model, window_size, downsample = load_model(weights_path, device)
     print(
         f"Fold {fold}: {len(test_names)} datasets | "
-        f"weights={weights_path} | device={device} | window_size={window_size} | pool_kernel_um={cfg.pool_kernel_um}",
+        f"weights={weights_path} | device={device} | "
+        f"window_size={window_size} | "
+        f"pool_kernel_um={cfg.pool_kernel_um} | "
+        f"det_threshold={cfg.det_threshold} | "
+        f"edge_threshold={cfg.threshold} | "
+        f"max_children={cfg.max_children_per_node} | "
+        f"max_parents={cfg.max_parents_per_node}",
         flush=True,
     )
 
