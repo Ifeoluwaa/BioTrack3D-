@@ -109,14 +109,13 @@ def evaluate_pairs(
 
 
 def evaluate_run(run: dict, max_distance: float = 7.0) -> list[dict]:
-    """Score the predicted geffs in ``run['dir']`` against GT in ``DATASET_PATH``.
+    """Score the predicted geffs in run['dir'] against GT in DATASET_PATH."""
 
-    Thin shim so ``scripts/predict_unet_transformer.py`` can evaluate a fresh
-    prediction run right after inference.
-    """
+    print("DATASET_PATH =", DATASET_PATH)
+    print("Prediction dir =", run["dir"])
+
     rows, _ = evaluate_pairs(run["dir"], DATASET_PATH, max_distance=max_distance)
     return rows
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Score predicted .geff graphs against ground-truth .geff graphs.")

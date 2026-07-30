@@ -1700,7 +1700,7 @@ def main() -> None:
             pool_sigma=args.pool_sigma,
             attn_dim=args.attn_dim,
             seed=args.seed,
-            
+            output_dir=Path(args.output_dir),
         )
 
 

@@ -146,12 +146,15 @@ class SimpleNodeTransformer(nn.Module):
         # Unit direction vector (computed from raw_delta)
         direction = raw_delta / (distance + eps)
 
+        # Scale distance features to match scaled_delta
+        distance = distance / 100.0
+        distance_sq = distance_sq / 10000.0
+
         # Scaled relative displacement passed to MLP
         scaled_delta = raw_delta / 100.0
 
         # Cosine similarity of q and k
         cos_similarity = F.cosine_similarity(qe, ke, dim=-1).unsqueeze(-1)
-
         # Concatenate features along the channel dimension
         return torch.cat([
             qe,
