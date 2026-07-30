@@ -201,8 +201,6 @@ def load_model(
 
     missing, unexpected = model.load_state_dict(state, strict=False)
 
-    print("Missing keys:", missing)
-    print("Unexpected keys:", unexpected)
     model = model.to(device)
     model.eval()
     return model, config["window_size"], downsample
@@ -290,13 +288,7 @@ def _detect_cells_pooled(
     pooled = F.max_pool3d(logits, pool_kernel, stride=1, padding=pad)
     is_peak = (logits == pooled) & (torch.sigmoid(logits) > det_threshold)
     probs = torch.sigmoid(logits)
-    print(
-        f"max={probs.max().item():.4f}, "
-        f"mean={probs.mean().item():.4f}, "
-        f">0.99={(probs > 0.99).sum().item()}, "
-        f">0.95={(probs > 0.95).sum().item()}, "
-        f">0.50={(probs > 0.50).sum().item()}"
-)
+    
     peak_idx = torch.nonzero(is_peak[0, 0])  # (N, 3)
 
     if peak_idx.shape[0] == 0:
@@ -409,7 +401,6 @@ def predict_video(
                 arr = _detect_cells_pooled(
                     det_logits[f_idx][0], t, cfg.det_threshold, pool_k,
                 )
-                print(f"Frame {t}: {len(arr)} detections")
                 coord_offset[t] = (global_node_count, global_node_count + len(arr))
                 global_node_count += len(arr)
                 coord_lists.append(arr)
@@ -467,6 +458,8 @@ def predict_video(
             )  # (1, n_src, n_tgt)
 
             raw = edge_logits_pair[0]
+            
+
             if cfg.edge_activation == "softmax":
                 probs = torch.softmax(raw, dim=0).cpu().numpy()
             else:
@@ -484,7 +477,7 @@ def predict_video(
 
             children_count: dict[int, int] = {}
             parents_count: dict[int, int] = {}
-
+            edges_before = len(all_edges)
             for prob, i, j in candidates:
                 n_ch = children_count.get(i, 0)
                 n_pa = parents_count.get(j, 0)
@@ -501,7 +494,7 @@ def predict_video(
                 all_edges.append((gi, gj, float(prob), dist))
                 children_count[i] = n_ch + 1
                 parents_count[j] = n_pa + 1
-
+                
         del unet_out
 
     coords = np.concatenate(coord_lists) if coord_lists else np.empty((0, 4), dtype=np.int16)
@@ -553,11 +546,6 @@ def predict(
                 "test": stems[:n_val],
             }]
 
-            print(
-                f"No splits file at {splits_file}; "
-                f"generated seed-0 split ({len(stems)-n_val} train / {n_val} val).",
-                flush=True,
-            )
 
         test_names = folds[fold]["test"]
 
@@ -577,17 +565,7 @@ def predict(
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, window_size, downsample = load_model(weights_path, device)
-    print(
-        f"Fold {fold}: {len(test_names)} datasets | "
-        f"weights={weights_path} | device={device} | "
-        f"window_size={window_size} | "
-        f"pool_kernel_um={cfg.pool_kernel_um} | "
-        f"det_threshold={cfg.det_threshold} | "
-        f"edge_threshold={cfg.threshold} | "
-        f"max_children={cfg.max_children_per_node} | "
-        f"max_parents={cfg.max_parents_per_node}",
-        flush=True,
-    )
+    
 
     for name in tqdm(test_names, desc="Predicting", disable=not INTERACTIVE):
         ds_path = data_dir / name
@@ -610,8 +588,6 @@ def predict(
                 graph = solver.solve(graph)
         save_graph(graph, output_dir / f"{name}.geff")
 
-    print(f"Saved {len(test_names)} predictions to {output_dir}", flush=True)
-
     if evaluate:
         run = {
             "username": USERNAME,
@@ -622,16 +598,6 @@ def predict(
         }
         results = evaluate_run(run)
         s = summarise(results)
-        print(
-            f"Evaluation ({len(results)} videos): "
-            f"score={s['score']:.4f}  "
-            f"edge_jaccard={s['edge_jaccard']:.4f}  "
-            f"adj_edge_jaccard={s['adj_edge_jaccard']:.4f} (n_adj={s['n_adj']})  "
-            f"division_jaccard={s['division_jaccard']:.4f} "
-            f"(TP={s['division_tp']} FP={s['division_fp']} FN={s['division_fn']})  "
-            f"node_recall={s['node_recall']:.4f}  (n={s['n']})",
-            flush=True,
-        )
 
 
 # =============================================================================

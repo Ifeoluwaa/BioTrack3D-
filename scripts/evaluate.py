@@ -74,7 +74,15 @@ def evaluate_pairs(
     pred_names = {p.stem for p in pred_dir.glob("*.geff")}
     gt_names = {p.stem for p in gt_dir.glob("*.geff")}
     names = sorted(pred_names & gt_names)
-    print(f"{len(names)} datasets in both pred and GT (of {len(pred_names)} pred / {len(gt_names)} GT)")
+    
+    if len(names) == 0:
+        raise RuntimeError(
+            "No matching GEFF files found.\n"
+            f"Prediction dir: {pred_dir}\n"
+            f"Ground-truth dir: {gt_dir}\n"
+            f"Prediction files: {len(pred_names)}\n"
+            f"Ground-truth files: {len(gt_names)}"
+        )
 
     rows: list[dict] = []
     skipped: list[str] = []
@@ -97,11 +105,6 @@ def evaluate_pairs(
             continue
 
         rows.append(per_sample_metrics(er, n_total, recall))
-        print(
-            f"  {name}: edge TP/FP/FN={er.edge_tp}/{er.edge_fp}/{er.edge_fn} "
-            f"div TP/FP/FN={er.division_tp}/{er.division_fp}/{er.division_fn} "
-            f"n_pred={er.num_pred_nodes}"
-        )
 
     if skipped:
         print(f"\nSkipped {len(skipped)} unreadable datasets: {skipped}")
@@ -126,16 +129,6 @@ def main() -> None:
 
     rows, _ = evaluate_pairs(args.pred_dir, args.gt_dir, max_distance=args.max_distance)
     s = summarise(rows)
-    print("\n=== Summary ===")
-    print(
-        f"n={s['n']}  score={s['score']:.4f}  "
-        f"edge_jaccard={s['edge_jaccard']:.4f}  "
-        f"adj_edge_jaccard={s['adj_edge_jaccard']:.4f} (n_adj={s['n_adj']})  "
-        f"division_jaccard={s['division_jaccard']:.4f} "
-        f"(TP={s['division_tp']} FP={s['division_fp']} FN={s['division_fn']})  "
-        f"node_recall={s['node_recall']:.4f}"
-    )
-
-
+    
 if __name__ == "__main__":
     main()

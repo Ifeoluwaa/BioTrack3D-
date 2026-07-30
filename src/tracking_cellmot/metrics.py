@@ -175,11 +175,26 @@ def _evaluate(
             from scipy.sparse import SparseEfficiencyWarning
             warnings.filterwarnings("ignore", category=SparseEfficiencyWarning)
             graph.match(gt_graph, matching=matching)
+            node_attrs = graph.node_attrs(
+                attr_keys=[
+                    td.DEFAULT_ATTR_KEYS.NODE_ID,
+                    td.DEFAULT_ATTR_KEYS.MATCHED_NODE_ID,
+                ]
+            )
+
+            matched = (
+                node_attrs[
+                    td.DEFAULT_ATTR_KEYS.MATCHED_NODE_ID
+                ] != -1
+            ).sum()
+
+            print(f"Matched nodes = {matched} / {graph.num_nodes()}")
     finally:
         set_options(show_progress=prev_show_progress)
 
     edge_attrs = _evaluate_matched_graph(graph, gt_graph)
 
+    
     return _compute_score(edge_attrs, gt_graph.num_edges(), metric)
 
 

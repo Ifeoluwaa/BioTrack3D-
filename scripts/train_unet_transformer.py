@@ -61,24 +61,60 @@ def compute_gt_transition_matrix(
 
 
 def compute_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """BCE on annotated rows and columns (sparse GT — unannotated cells ignored)."""
+    """
+    BCE on annotated parent-child pairs only.
+
+    The original implementation used:
+        mask = active_rows | active_cols
+
+    which allows all-zero rows/columns to contribute to the loss.
+    This version requires BOTH the source row and target column
+    to be active before contributing to the loss.
+    """
+
+    # Rows that contain at least one GT edge
     active_rows = target.sum(dim=1) > 0
+
+    # Columns that contain at least one GT edge
     active_cols = target.sum(dim=0) > 0
-    mask = active_rows.unsqueeze(1) | active_cols.unsqueeze(0)
+
+    # Only supervise pairs where BOTH row and column are active
+    mask = active_rows.unsqueeze(1) & active_cols.unsqueeze(0)
+
+    # Nothing to supervise
     if not mask.any():
-        return torch.tensor(0.0, requires_grad=True, device=logits.device)
+        return torch.tensor(
+            0.0,
+            requires_grad=True,
+            device=logits.device,
+        )
 
-    probs = torch.softmax(logits, dim=0)  # dim=0 intentional: divisions allowed, merges aren't
-    bce = F.binary_cross_entropy(probs, target, reduction="none")
-    p_t = probs * target + (1 - probs) * (1 - target)
-    loss = ((1 - p_t) ** 2) * bce
+    # Parent probabilities for each child
+    probs = torch.softmax(logits, dim=0)
 
+    # BCE loss
+    bce = F.binary_cross_entropy(
+        probs,
+        target,
+        reduction="none",
+    )
+
+    # Focal-style weighting
+    p_t = probs * target + (1.0 - probs) * (1.0 - target)
+    loss = ((1.0 - p_t) ** 2) * bce
+
+    # Optional weighting for division rows
     div_rows = target.sum(dim=1) > 1
+
     weight = torch.ones_like(loss)
     weight[div_rows] = 1.0
 
-    return (loss * weight)[mask].mean()
+    # Average only over supervised entries
 
+    if not hasattr(compute_loss, "_debug_printed"):
+      compute_loss._debug_printed = True
+
+    return (loss * weight)[mask].mean()
 
 def compute_batch_loss(
     logits: torch.Tensor,
@@ -1084,6 +1120,7 @@ def build_matched_edge_targets(
         block = gt_trans[safe_t][:, safe_t1] * valid_mask.float()
         target[b, :n_t, :n_t1] = block
 
+
     return target
 
 
@@ -1216,13 +1253,7 @@ def train_epoch(
         t0 = time.perf_counter()
 
     t_total = t_data + t_forward + t_backward
-    if t_total > 0:
-        print(
-            f"  [timing] data: {t_data:.1f}s ({100*t_data/t_total:.0f}%) | "
-            f"forward: {t_forward:.1f}s ({100*t_forward/t_total:.0f}%) | "
-            f"backward: {t_backward:.1f}s ({100*t_backward/t_total:.0f}%) | "
-            f"total: {t_total:.1f}s"
-        )
+  
 
     return (
         total_edge_loss / max(n_samples, 1),
@@ -1368,12 +1399,10 @@ def train(
             random.Random(0).shuffle(stems)
             n_val = max(1, len(stems) // 10)
             folds = [{"split": 0, "train": stems[n_val:], "test": stems[:n_val]}]
-            print(f"No splits file at {splits_file}; generated seed-0 split "
-                  f"({len(stems) - n_val} train / {n_val} val).", flush=True)
+            
         fold_data = folds[fold]
         train_files = [data_dir / name for name in fold_data["train"]]
         test_files = [data_dir / name for name in fold_data["test"]]
-        print(f"Fold {fold}: {len(train_files)} train, {len(test_files)} test", flush=True)
 
     if output_dir is None:
         experiment_name = f"{method}_{pooling_mode}"
@@ -1410,7 +1439,6 @@ def train(
             )
             data.append((video_meta, windows))
         n_windows = sum(len(w) for _, w in data)
-        print(f"  {desc} done: {n_windows} windows total", flush=True)
         return data
 
     train_video_data = _load(train_files, "train")
@@ -1453,7 +1481,6 @@ def train(
     else:
         device = torch.device("cpu")
     
-    print(f"Using device: {device}", flush=True)
 
     n_visible = 0
     if device.type == "cuda":
@@ -1488,11 +1515,7 @@ def train(
     # the DataParallel "module." prefix stripped so they load on a single GPU.
     if data_parallel and device.type == "cuda" and n_visible > 1:
         model.unet = nn.DataParallel(model.unet)
-        print(
-            f"DataParallel: UNet split across {n_visible} GPUs "
-            f"(effective per-GPU batch {max(1, batch_size // n_visible)})",
-            flush=True,
-        )
+        
     elif device.type == "cuda":
         reason = "--single-gpu set" if not data_parallel else f"only {n_visible} GPU visible"
         print(f"Single-GPU training ({reason}). For 2 GPUs set the Kaggle accelerator to 'GPU T4 x2'.", flush=True)
@@ -1587,12 +1610,7 @@ def train(
 
         marker = "*" if is_best else " "
         pbar.set_postfix(edge=f"{edge_loss:.4f}", det=f"{det_loss:.4f}", acc=f"{test_acc:.4f}")
-        print(
-            f"  Epoch {epoch:3d}/{n_epochs} | edge={edge_loss:.4f} | det={det_loss:.4f} | "
-            f"test_loss={test_loss:.4f} | acc={test_acc:.4f} | recall={test_recall:.4f} | best={best_score:.4f} {marker} | "
-            f"train={train_time:.1f}s test={test_time:.1f}s",
-            flush=True,
-        )
+        
 
     print(f"\nBest score (acc*recall): {best_score:.4f}, saved to {save_path}", flush=True)
     if save_path.exists():
