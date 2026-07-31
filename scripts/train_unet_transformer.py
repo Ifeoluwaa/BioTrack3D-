@@ -1569,6 +1569,15 @@ def train(
         test_time = time.monotonic() - t0
 
         score = test_acc * test_recall
+        print(
+            f"Epoch {epoch+1}: "
+            f"Edge Loss={edge_loss:.4f}, "
+            f"Detection Loss={det_loss:.4f}, "
+            f"Recall={test_recall:.4f}, "
+            f"Accuracy={test_acc:.4f}, "
+            f"Score={score:.4f}",
+            flush=True,
+)
         is_best = score >= best_score
 
         clean_state = {

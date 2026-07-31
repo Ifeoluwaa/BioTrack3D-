@@ -598,7 +598,7 @@ def predict(
         }
         results = evaluate_run(run)
         s = summarise(results)
-
+        print(s)
 
 # =============================================================================
 # CLI
