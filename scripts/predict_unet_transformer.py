@@ -457,7 +457,12 @@ def predict_video(
 
             raw = edge_logits_pair[0]
             if cfg.edge_activation == "softmax":
-                probs = torch.softmax(raw, dim=0).cpu().numpy()
+                # Append a dummy parent row of zeros -> shape: (n_src + 1, n_tgt)
+                dummy_row = torch.zeros(1, raw.shape[1], device=raw.device, dtype=raw.dtype)
+                raw_with_dummy = torch.cat([raw, dummy_row], dim=0)
+                probs_with_dummy = torch.softmax(raw_with_dummy, dim=0)
+                # Slice back to extract probabilities of the real parents only
+                probs = probs_with_dummy[:raw.shape[0]].cpu().numpy()
             else:
                 probs = torch.sigmoid(raw).cpu().numpy()
 

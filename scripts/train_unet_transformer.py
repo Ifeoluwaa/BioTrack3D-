@@ -60,24 +60,40 @@ def compute_gt_transition_matrix(
     return matrix
 
 
-def compute_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """BCE on annotated rows and columns (sparse GT — unannotated cells ignored)."""
+def compute_loss(logits: torch.Tensor, target: torch.Tensor, div_weight: float = 1.0) -> torch.Tensor:
+    """BCE on annotated rows and columns with a dummy parent for cell appearances."""
+    # Append a dummy parent row of zeros to logits -> shape: (N_t + 1, N_t1)
+    dummy_logit_row = torch.zeros(1, logits.shape[1], device=logits.device, dtype=logits.dtype)
+    logits_with_dummy = torch.cat([logits, dummy_logit_row], dim=0)
+
+    # Append a dummy parent row to target representing 1.0 - sum(real_parents)
+    col_sum = target.sum(dim=0, keepdim=True)
+    dummy_target_row = (1.0 - col_sum).clamp(min=0.0, max=1.0)
+    target_with_dummy = torch.cat([target, dummy_target_row], dim=0)
+
+    # Handle active masks (only calculate loss on annotated regions)
     active_rows = target.sum(dim=1) > 0
     active_cols = target.sum(dim=0) > 0
     mask = active_rows.unsqueeze(1) | active_cols.unsqueeze(0)
     if not mask.any():
         return torch.tensor(0.0, requires_grad=True, device=logits.device)
 
-    probs = torch.softmax(logits, dim=0)  # dim=0 intentional: divisions allowed, merges aren't
-    bce = F.binary_cross_entropy(probs, target, reduction="none")
-    p_t = probs * target + (1 - probs) * (1 - target)
+    # Extend mask to the dummy parent row for columns that have active entries
+    dummy_mask_row = mask.any(dim=0, keepdim=True)
+    mask_with_dummy = torch.cat([mask, dummy_mask_row], dim=0)
+
+    # Softmax over the N_t + 1 dimensions (columns sum to 1.0)
+    probs = torch.softmax(logits_with_dummy, dim=0)
+    bce = F.binary_cross_entropy(probs, target_with_dummy, reduction="none")
+    p_t = probs * target_with_dummy + (1 - probs) * (1 - target_with_dummy)
     loss = ((1 - p_t) ** 2) * bce
 
+    # Apply division weighting (upweight loss for dividing parents)
     div_rows = target.sum(dim=1) > 1
     weight = torch.ones_like(loss)
-    weight[div_rows] = 1.0
+    weight[:logits.shape[0]][div_rows] = div_weight
 
-    return (loss * weight)[mask].mean()
+    return (loss * weight)[mask_with_dummy].mean()
 
 
 def compute_batch_loss(
@@ -85,6 +101,7 @@ def compute_batch_loss(
     target: torch.Tensor,
     mask_t: torch.Tensor,
     mask_t1: torch.Tensor,
+    div_weight: float = 1.0,
 ) -> torch.Tensor:
     """Compute loss over a batch by slicing out real (unpadded) regions."""
     B = logits.shape[0]
@@ -92,13 +109,14 @@ def compute_batch_loss(
     for b in range(B):
         nt = mask_t[b].sum().item()
         nt1 = mask_t1[b].sum().item()
-        losses.append(compute_loss(logits[b, :nt, :nt1], target[b, :nt, :nt1]))
+        losses.append(compute_loss(logits[b, :nt, :nt1], target[b, :nt, :nt1], div_weight=div_weight))
     return torch.stack(losses).mean()
 
 
 def _evaluate_pair(
     logits: torch.Tensor,
     target: torch.Tensor,
+    div_weight: float = 1.0,
 ) -> tuple[float, int, int]:
     """Per-pair evaluation. Returns (loss, correct, total)."""
     active_rows = target.sum(dim=1) > 0
@@ -106,8 +124,13 @@ def _evaluate_pair(
     if not active_rows.any():
         return 0.0, 0, 0
 
-    loss = compute_loss(logits, target).item()
-    probs = torch.softmax(logits, dim=0)
+    loss = compute_loss(logits, target, div_weight=div_weight).item()
+    
+    # Re-compute probabilities using the dummy softmax
+    dummy_row = torch.zeros(1, logits.shape[1], device=logits.device, dtype=logits.dtype)
+    logits_with_dummy = torch.cat([logits, dummy_row], dim=0)
+    probs_with_dummy = torch.softmax(logits_with_dummy, dim=0)
+    probs = probs_with_dummy[:logits.shape[0]]  # real parent probabilities
     preds = (probs > 0.5).float()
 
     mask = active_rows.unsqueeze(1) | active_cols.unsqueeze(0)
@@ -1100,6 +1123,7 @@ def train_epoch(
     det_neg_weight: float = 0.1,
     max_iters: int | None = None,
     pool_kernel_um: float = 5.0,
+    div_weight: float = 1.0,
 ) -> tuple[float, float]:
     """Train for one epoch, return (avg edge loss, avg detection loss).
 
@@ -1188,6 +1212,7 @@ def train_epoch(
             block_losses.append(compute_batch_loss(
                 edge_logits, pair_target,
                 frame_det[i][2], frame_det[i + 1][2],
+                div_weight=div_weight,
             ))
         edge_loss = sum(block_losses) / len(block_losses)
 
@@ -1236,6 +1261,7 @@ def evaluate(
     loader: DataLoader,
     device: torch.device,
     pool_kernel_um: float = 5.0,
+    div_weight: float = 1.0,
 ) -> tuple[float, float, float]:
     """Evaluate model using detect→match→predict (same path as training).
 
@@ -1299,6 +1325,7 @@ def evaluate(
                 nt_b = int(frame_det[i + 1][2][b].sum().item())
                 pair_loss, pair_correct, pair_total = _evaluate_pair(
                     pair_logits[b, :ns_b, :nt_b], pair_target[b, :ns_b, :nt_b],
+                    div_weight=div_weight,
                 )
                 total_loss += pair_loss
                 correct += pair_correct
@@ -1341,6 +1368,7 @@ def train(
     pool_sigma: float | None = None,
     attn_dim: int | None = None,
     output_dir: Path | None = None,
+    div_weight: float = 1.0,
 ) -> UNetNodeTransformer:
     """Train on one fold from a pre-computed splits file.
 
@@ -1537,12 +1565,12 @@ def train(
         t0 = time.monotonic()
         edge_loss, det_loss = train_epoch(
             model, train_loader, optimizer, device, det_loss_weight, det_neg_weight,
-            max_iters=max_iters, pool_kernel_um=pool_kernel_um,
+            max_iters=max_iters, pool_kernel_um=pool_kernel_um, div_weight=div_weight,
         )
         train_time = time.monotonic() - t0
 
         t0 = time.monotonic()
-        test_loss, test_acc, test_recall = evaluate(model, test_loader, device, pool_kernel_um=pool_kernel_um)
+        test_loss, test_acc, test_recall = evaluate(model, test_loader, device, pool_kernel_um=pool_kernel_um, div_weight=div_weight)
         test_time = time.monotonic() - t0
 
         score = test_acc * test_recall
@@ -1660,6 +1688,8 @@ def main() -> None:
                         help="Random seed for reproducibility.")
     parser.add_argument("--output-dir", type=str, default="weights/unet_transformer",
                         help="Directory to save checkpoint files.")
+    parser.add_argument("--div-weight", type=float, default=5.0,
+                        help="Loss weight multiplier for cell division edges.")
 
     args = parser.parse_args()
 
@@ -1700,7 +1730,7 @@ def main() -> None:
             pool_sigma=args.pool_sigma,
             attn_dim=args.attn_dim,
             seed=args.seed,
-            
+            div_weight=args.div_weight,
         )
 
 
