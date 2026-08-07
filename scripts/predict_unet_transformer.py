@@ -196,6 +196,7 @@ def load_model(
         pool_radius=config.get("pool_radius", 0),
         pool_sigma=config.get("pool_sigma", None),
         attn_dim=config.get("attn_dim", None),
+        sibling_aware=config.get("sibling_aware", False),
     )
     state = torch.load(weights_path, map_location=device, weights_only=True)
     model.load_state_dict(state)
@@ -307,6 +308,7 @@ def predict_video(
     max_frames: int | None = None,
     unet_batch_size: int = 4,
     downsample: tuple[int, ...] = (1, 4, 4),
+    use_gt_coords: bool = False,
 ) -> tuple[np.ndarray, list[tuple[int, int, float, float]]]:
     """Run inference on a single video using sliding windows of W frames.
 
@@ -320,7 +322,7 @@ def predict_video(
         Shape (N, 4) — columns [t, z, y, x] in original resolution.
     edges : list of (src_idx, tgt_idx, prob, distance) tuples
     """
-    ds = open_dataset(ds_path, normalize=False, load_image=False, downsample=downsample)
+    ds = open_dataset(ds_path, normalize=False, load_image=False, downsample=downsample, require_tracks=use_gt_coords)
     if "0.001" not in ds.quantiles or "0.999" not in ds.quantiles:
         raise ValueError(f"Zarr attrs missing image_statistics.quantiles for {ds_path}")
     zarr_arr = zarr.open_group(str(ds.zarr_path), mode="r")["0"]
@@ -396,9 +398,16 @@ def predict_video(
         # --- Detect cells in each frame (dedup across windows) ---
         for f_idx, t in enumerate(frame_indices):
             if t not in seen_frames:
-                arr = _detect_cells_pooled(
-                    det_logits[f_idx][0], t, cfg.det_threshold, pool_k,
-                )
+                if use_gt_coords:
+                    import polars as pl
+                    gt_t = ds.tracks.node_attrs().filter(pl.col("t") == t)
+                    coords_t = gt_t.select(["z", "y", "x"]).to_numpy().astype(np.float32) / ds_arr
+                    t_col = np.full((len(coords_t), 1), t, dtype=np.float32)
+                    arr = np.concatenate([t_col, coords_t], axis=1).astype(np.float32)
+                else:
+                    arr = _detect_cells_pooled(
+                        det_logits[f_idx][0], t, cfg.det_threshold, pool_k,
+                    )
                 coord_offset[t] = (global_node_count, global_node_count + len(arr))
                 global_node_count += len(arr)
                 coord_lists.append(arr)

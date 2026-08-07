@@ -74,9 +74,11 @@ class SimpleNodeTransformer(nn.Module):
         mlp_ratio: float = 2.0,
         dropout: float = 0.3,
         pair_chunk_size: int | None = 32,
+        sibling_aware: bool = True,
     ):
         super().__init__()
         self.pair_chunk_size = pair_chunk_size
+        self.sibling_aware = sibling_aware
         self.proj = nn.Linear(feat_dim, hidden_dim)
         self.norm_in = nn.LayerNorm(hidden_dim)
 
@@ -88,7 +90,8 @@ class SimpleNodeTransformer(nn.Module):
         self.norm_out = nn.LayerNorm(hidden_dim)
 
         # MLP for pairwise scoring: concatenated features (q, k, |q-k|, rel_xyz, dist, dist^2, dir_xyz, cos_sim)
-        pair_in_dim = hidden_dim * 3 + 9
+        # Sibling-aware geometry adds 5 extra features.
+        pair_in_dim = hidden_dim * 3 + (14 if sibling_aware else 9)
         self.pair_mlp = nn.Sequential(
             nn.Linear(pair_in_dim, hidden_dim),
             nn.GELU(),
@@ -124,10 +127,21 @@ class SimpleNodeTransformer(nn.Module):
         Returns
         -------
         torch.Tensor
-            Pairwise features, shape (B, N_c, N_t1, 3 * H + 9).
+            Pairwise features, shape (B, N_c, N_t1, 3 * H + 9 or 14).
         """
+        B = qc.shape[0]
         nc_i = qc.shape[1]
         n1 = kk.shape[1]
+
+        original_n1 = n1
+        needs_padding = getattr(self, "sibling_aware", False) and (n1 < 2)
+        if needs_padding:
+            pad_len = 2 - n1
+            kk_pad = torch.zeros(B, pad_len, kk.shape[-1], device=kk.device, dtype=kk.dtype)
+            kk = torch.cat([kk, kk_pad], dim=1)
+            cc1_pad = torch.full((B, pad_len, 3), 9999.0, device=cc1.device, dtype=cc1.dtype)
+            cc1 = torch.cat([cc1, cc1_pad], dim=1)
+            n1 = 2
 
         # Expand q and k to (B, N_c, N_t1, H)
         qe = qc.unsqueeze(2).expand(-1, -1, n1, -1)
@@ -153,7 +167,7 @@ class SimpleNodeTransformer(nn.Module):
         cos_similarity = F.cosine_similarity(qe, ke, dim=-1).unsqueeze(-1)
 
         # Concatenate features along the channel dimension
-        return torch.cat([
+        standard_features = torch.cat([
             qe,
             ke,
             abs_diff,
@@ -163,6 +177,66 @@ class SimpleNodeTransformer(nn.Module):
             direction,
             cos_similarity
         ], dim=-1)
+
+        if not getattr(self, "sibling_aware", False):
+            return standard_features
+
+        # Sibling-aware geometric features computation (fully vectorized)
+        dist_matrix = distance.squeeze(-1)  # (B, N_c, N_t1)
+        
+        # Get top-2 minimum distances and indices along target dimension
+        top2_val, top2_idx = torch.topk(dist_matrix, k=2, dim=-1, largest=False)
+        k1_idx = top2_idx[..., 0]  # (B, N_c)
+        k2_idx = top2_idx[..., 1]  # (B, N_c)
+
+        # Sibling index is k1_idx unless target j is k1_idx, in which case it is k2_idx
+        j_tensor = torch.arange(n1, device=kk.device).view(1, 1, n1).expand(B, nc_i, -1)
+        is_k1 = (j_tensor == k1_idx.unsqueeze(-1))
+        sib_idx = torch.where(is_k1, k2_idx.unsqueeze(-1), k1_idx.unsqueeze(-1))  # (B, N_c, N_t1)
+
+        # Flatten gather of sibling coordinates
+        batch_offsets = torch.arange(B, device=cc1.device).view(B, 1, 1) * n1
+        flat_sib_idx = sib_idx + batch_offsets
+        cc1_flat = cc1.reshape(-1, 3)
+        cc1_sib = cc1_flat[flat_sib_idx].view(B, nc_i, n1, 3)
+
+        cc_exp = cc.unsqueeze(2).expand(-1, -1, n1, -1)
+        cc1_exp = cc1.unsqueeze(1).expand(-1, nc_i, -1, -1)
+
+        # 1. Sibling distance to parent: d(i, j')
+        delta_sib = cc_exp - cc1_sib
+        dist_sib = torch.sqrt(torch.sum(delta_sib**2, dim=-1, keepdim=True) + 1e-12)
+
+        # 2. Sibling-sibling distance: d(j, j')
+        delta_ss = cc1_exp - cc1_sib
+        dist_ss = torch.sqrt(torch.sum(delta_ss**2, dim=-1, keepdim=True) + 1e-12)
+
+        # 3. Midpoint distance: d(i, (j + j')/2)
+        midpoint = 0.5 * (cc1_exp + cc1_sib)
+        delta_mid = cc_exp - midpoint
+        dist_mid = torch.sqrt(torch.sum(delta_mid**2, dim=-1, keepdim=True) + 1e-12)
+
+        # 4. Symmetric distance difference: |d(i, j) - d(i, j')|
+        dist_diff = torch.abs(distance - dist_sib)
+
+        # 5. Division angle cosine
+        v_child = cc1_exp - cc_exp
+        v_sib = cc1_sib - cc_exp
+        cos_theta = torch.sum(v_child * v_sib, dim=-1, keepdim=True) / (distance * dist_sib + 1e-8)
+
+        out = torch.cat([
+            standard_features,
+            dist_mid,
+            dist_ss,
+            cos_theta,
+            dist_diff,
+            dist_sib
+        ], dim=-1)
+
+        if needs_padding:
+            out = out[:, :, :original_n1, :]
+
+        return out
 
     def forward(
         self,

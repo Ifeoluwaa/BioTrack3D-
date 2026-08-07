@@ -341,6 +341,7 @@ class FrameWindowDataset(Dataset):
 
         self.max_nodes = max_nodes
         self.augmentations = augmentations or []
+        self._zarr_cache = {}
 
         self._data: list[tuple[dict, VideoMeta]] = []
         for video_meta, windows in video_data:
@@ -357,7 +358,9 @@ class FrameWindowDataset(Dataset):
         W = meta["n_frames"]
         dz, dy, dx = vm.downsample
 
-        z = zarr.open_group(str(vm.zarr_path), mode="r")["0"]
+        if vm.zarr_path not in self._zarr_cache:
+            self._zarr_cache[vm.zarr_path] = zarr.open_group(str(vm.zarr_path), mode="r")["0"]
+        z = self._zarr_cache[vm.zarr_path]
         target_shape = list(vm.image_shape[1:])
 
         # Strided read from zarr — spatial downsample at I/O time: (W, Z_ds, Y_ds, X_ds)
@@ -642,6 +645,7 @@ class UNetNodeTransformer(nn.Module):
         pool_sigma: float | None = None,
         attn_dim: int | None = None,
         voxel_spacing: tuple[float, float, float] = (1.625, 0.40625, 0.40625),
+        sibling_aware: bool = True,
     ):
         super().__init__()
 
@@ -651,6 +655,7 @@ class UNetNodeTransformer(nn.Module):
         self.pool_radius = pool_radius
         self.pool_sigma = pool_sigma if pool_sigma is not None else max(pool_radius / 2, 0.75)
         self.voxel_spacing = voxel_spacing
+        self.sibling_aware = sibling_aware
 
         # Cache Gaussian kernel
         self._gaussian_kernel = None
@@ -674,6 +679,7 @@ class UNetNodeTransformer(nn.Module):
             n_heads=n_heads,
             n_blocks=n_blocks,
             dropout=dropout,
+            sibling_aware=sibling_aware,
         )
 
     def _extract_single_voxel(
@@ -1369,6 +1375,7 @@ def train(
     attn_dim: int | None = None,
     output_dir: Path | None = None,
     div_weight: float = 1.0,
+    sibling_aware: bool = True,
 ) -> UNetNodeTransformer:
     """Train on one fold from a pre-computed splits file.
 
@@ -1422,6 +1429,7 @@ def train(
         "pool_radius": pool_radius,
         "pool_sigma": pool_sigma,
         "attn_dim": attn_dim,
+        "sibling_aware": sibling_aware,
     }
     (output_dir / "config.json").write_text(json.dumps(model_config, indent=2))
 
@@ -1474,7 +1482,10 @@ def train(
         generator=g, worker_init_fn=init_fn,
     )
 
-    if torch.cuda.is_available():
+    import os
+    if os.environ.get("FORCE_CPU") == "1":
+        device = torch.device("cpu")
+    elif torch.cuda.is_available():
         device = torch.device("cuda")
     elif torch.backends.mps.is_available():
         device = torch.device("mps")
@@ -1497,6 +1508,11 @@ def train(
     )
     if unet_weights is not None:
         state = torch.load(unet_weights, map_location="cpu", weights_only=True)
+        # Strip "unet." prefix if present to support full model checkpoints
+        state = {
+            (k.replace("unet.", "", 1) if k.startswith("unet.") else k): v
+            for k, v in state.items()
+        }
         missing, unexpected = unet.load_state_dict(state, strict=False)
         print(f"  UNet weights: {len(missing)} missing, {len(unexpected)} unexpected", flush=True)
 
@@ -1508,6 +1524,7 @@ def train(
         pool_radius=pool_radius,
         pool_sigma=pool_sigma,
         attn_dim=attn_dim,
+        sibling_aware=sibling_aware,
     ).to(device)
 
     # Simple multi-GPU: split the heavy UNet pass across all visible GPUs.
@@ -1623,7 +1640,7 @@ def train(
         )
 
     print(f"\nBest score (acc*recall): {best_score:.4f}, saved to {save_path}", flush=True)
-    if save_path.exists():
+    if save_path.exists() and debug_video is None:
         state = torch.load(save_path, map_location=device, weights_only=True)
         if isinstance(model.unet, nn.DataParallel):
             state = {
@@ -1690,6 +1707,10 @@ def main() -> None:
                         help="Directory to save checkpoint files.")
     parser.add_argument("--div-weight", type=float, default=5.0,
                         help="Loss weight multiplier for cell division edges.")
+    parser.add_argument("--sibling-aware", dest="sibling_aware", action="store_true", default=True,
+                        help="Enable sibling-aware geometric features in the edge prediction pipeline (default: on).")
+    parser.add_argument("--no-sibling-aware", dest="sibling_aware", action="store_false",
+                        help="Disable sibling-aware geometric features.")
 
     args = parser.parse_args()
 
@@ -1731,6 +1752,7 @@ def main() -> None:
             attn_dim=args.attn_dim,
             seed=args.seed,
             div_weight=args.div_weight,
+            sibling_aware=args.sibling_aware,
         )
 
 
