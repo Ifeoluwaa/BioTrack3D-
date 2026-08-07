@@ -536,11 +536,29 @@ def predict(
         test_names = [debug_video.name]
         data_dir = debug_video.parent
     else:
-        folds = json.loads(splits_file.read_text())
+        if splits_file.exists():
+            folds = json.loads(splits_file.read_text())
+        else:
+            import random
+
+            stems = sorted(
+                p.stem
+                for p in data_dir.glob("*.zarr")
+                if (data_dir / f"{p.stem}.geff").exists()
+            )
+
+            random.Random(0).shuffle(stems)
+            n_val = max(1, len(stems) // 10)
+
+            folds = [{
+                "train": stems[n_val:],
+                "test": stems[:n_val],
+            }]
+
         test_names = folds[fold]["test"]
+
         if video_slice is not None:
             test_names = test_names[video_slice]
-
     from dataspec import PREDICTIONS_PATH
     output_dir = PREDICTIONS_PATH / USERNAME / method / f"split_{fold}"
     if output_dir.exists():
