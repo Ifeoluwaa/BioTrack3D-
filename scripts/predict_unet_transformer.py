@@ -65,7 +65,7 @@ class PredictConfig:
         Maximum number of outgoing edges per node (1 = no divisions, 2 = divisions allowed).
     """
     # Detection
-    det_threshold: float = 0.5
+    det_threshold: float = 0.3
     det_tta: bool = True  # flip-xy TTA for detection logits
     pool_kernel_um: float = 3.0  # max-pool kernel size in µm for detection peak extraction
     # Edge filtering
@@ -259,7 +259,7 @@ def pool_kernel_from_um(
 def _detect_cells_pooled(
     det_logits: torch.Tensor,
     t: int,
-    det_threshold: float = 0.5,
+    det_threshold: float = 0.3,
     pool_kernel: tuple[int, ...] = (3, 3, 3),
 ) -> np.ndarray:
     """Extract cell coordinates via max-pool local-max (same as training).
@@ -274,7 +274,7 @@ def _detect_cells_pooled(
     t : int
         Time index to prepend as the first column.
     det_threshold : float
-        Minimum sigmoid probability for a peak to be considered (default 0.5).
+        Minimum logit for a peak to be considered (default 0.3).
     pool_kernel : tuple[int, ...]
         Per-axis kernel size for local-max pooling,
         e.g. ``(3, 11, 11)`` for anisotropic data.
@@ -287,7 +287,7 @@ def _detect_cells_pooled(
     logits = det_logits.unsqueeze(0)  # (1, 1, Z, Y, X)
     pad = tuple(k // 2 for k in pool_kernel)
     pooled = F.max_pool3d(logits, pool_kernel, stride=1, padding=pad)
-    is_peak = (logits == pooled) & (torch.sigmoid(logits) > det_threshold)
+    is_peak = (logits == pooled) & (logits > det_threshold)
     peak_idx = torch.nonzero(is_peak[0, 0])  # (N, 3)
 
     if peak_idx.shape[0] == 0:
@@ -651,9 +651,9 @@ def main() -> None:
                         help="Number of frame pairs per UNet forward pass (default: 4).")
     parser.add_argument("--evaluate", action="store_true",
                         help="Run evaluation against GT after saving predictions.")
-    parser.add_argument("--det-threshold", type=float, default=0.99,
-                        help="Min sigmoid probability for a detection peak to be kept. "
-                             "Default 0.99: the detector is poorly calibrated because the "
+    parser.add_argument("--det-threshold", type=float, default=0.3,
+                        help="Min raw logit for a detection peak to be kept. "
+                             "Default 0.3: the detector is poorly calibrated because the "
                              "ground truth is sparse (only some cells annotated), so a high "
                              "threshold keeps precision up. Sweep it for your model.")
     parser.add_argument("--use-ilp", action="store_true",
