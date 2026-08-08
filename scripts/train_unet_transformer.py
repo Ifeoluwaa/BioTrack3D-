@@ -60,8 +60,13 @@ def compute_gt_transition_matrix(
     return matrix
 
 
-def compute_loss(logits: torch.Tensor, target: torch.Tensor, div_weight: float = 1.0) -> torch.Tensor:
-    """BCE on annotated rows and columns with a dummy parent for cell appearances."""
+def compute_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    div_weight: float = 1.0,
+    logit_l2_weight: float = 0.0,
+) -> torch.Tensor:
+    """BCE on annotated rows and columns with a dummy parent for cell appearances + optional logit L2 regularization."""
     # Append a dummy parent row of zeros to logits -> shape: (N_t + 1, N_t1)
     dummy_logit_row = torch.zeros(1, logits.shape[1], device=logits.device, dtype=logits.dtype)
     logits_with_dummy = torch.cat([logits, dummy_logit_row], dim=0)
@@ -76,24 +81,28 @@ def compute_loss(logits: torch.Tensor, target: torch.Tensor, div_weight: float =
     active_cols = target.sum(dim=0) > 0
     mask = active_rows.unsqueeze(1) | active_cols.unsqueeze(0)
     if not mask.any():
-        return torch.tensor(0.0, requires_grad=True, device=logits.device)
+        focal_loss = torch.tensor(0.0, requires_grad=True, device=logits.device)
+    else:
+        # Extend mask to the dummy parent row for columns that have active entries
+        dummy_mask_row = mask.any(dim=0, keepdim=True)
+        mask_with_dummy = torch.cat([mask, dummy_mask_row], dim=0)
 
-    # Extend mask to the dummy parent row for columns that have active entries
-    dummy_mask_row = mask.any(dim=0, keepdim=True)
-    mask_with_dummy = torch.cat([mask, dummy_mask_row], dim=0)
+        # Softmax over the N_t + 1 dimensions (columns sum to 1.0)
+        probs = torch.softmax(logits_with_dummy, dim=0)
+        bce = F.binary_cross_entropy(probs, target_with_dummy, reduction="none")
+        p_t = probs * target_with_dummy + (1 - probs) * (1 - target_with_dummy)
+        loss = ((1 - p_t) ** 2) * bce
 
-    # Softmax over the N_t + 1 dimensions (columns sum to 1.0)
-    probs = torch.softmax(logits_with_dummy, dim=0)
-    bce = F.binary_cross_entropy(probs, target_with_dummy, reduction="none")
-    p_t = probs * target_with_dummy + (1 - probs) * (1 - target_with_dummy)
-    loss = ((1 - p_t) ** 2) * bce
+        # Apply division weighting (upweight loss for dividing parents)
+        div_rows = target.sum(dim=1) > 1
+        weight = torch.ones_like(loss)
+        weight[:logits.shape[0]][div_rows] = div_weight
 
-    # Apply division weighting (upweight loss for dividing parents)
-    div_rows = target.sum(dim=1) > 1
-    weight = torch.ones_like(loss)
-    weight[:logits.shape[0]][div_rows] = div_weight
+        focal_loss = (loss * weight)[mask_with_dummy].mean()
 
-    return (loss * weight)[mask_with_dummy].mean()
+    # Logit L2 regularization (applied to all entries of raw logits, no mask, dummy row excluded)
+    reg_loss = logits.pow(2).mean()
+    return focal_loss + logit_l2_weight * reg_loss
 
 
 def compute_batch_loss(
@@ -102,6 +111,7 @@ def compute_batch_loss(
     mask_t: torch.Tensor,
     mask_t1: torch.Tensor,
     div_weight: float = 1.0,
+    logit_l2_weight: float = 0.0,
 ) -> torch.Tensor:
     """Compute loss over a batch by slicing out real (unpadded) regions."""
     B = logits.shape[0]
@@ -109,7 +119,12 @@ def compute_batch_loss(
     for b in range(B):
         nt = mask_t[b].sum().item()
         nt1 = mask_t1[b].sum().item()
-        losses.append(compute_loss(logits[b, :nt, :nt1], target[b, :nt, :nt1], div_weight=div_weight))
+        losses.append(compute_loss(
+            logits[b, :nt, :nt1],
+            target[b, :nt, :nt1],
+            div_weight=div_weight,
+            logit_l2_weight=logit_l2_weight,
+        ))
     return torch.stack(losses).mean()
 
 
@@ -117,6 +132,7 @@ def _evaluate_pair(
     logits: torch.Tensor,
     target: torch.Tensor,
     div_weight: float = 1.0,
+    logit_l2_weight: float = 0.0,
 ) -> tuple[float, int, int]:
     """Per-pair evaluation. Returns (loss, correct, total)."""
     active_rows = target.sum(dim=1) > 0
@@ -124,7 +140,7 @@ def _evaluate_pair(
     if not active_rows.any():
         return 0.0, 0, 0
 
-    loss = compute_loss(logits, target, div_weight=div_weight).item()
+    loss = compute_loss(logits, target, div_weight=div_weight, logit_l2_weight=logit_l2_weight).item()
     
     # Re-compute probabilities using the dummy softmax
     dummy_row = torch.zeros(1, logits.shape[1], device=logits.device, dtype=logits.dtype)
@@ -1130,6 +1146,7 @@ def train_epoch(
     max_iters: int | None = None,
     pool_kernel_um: float = 5.0,
     div_weight: float = 1.0,
+    logit_l2_weight: float = 0.0,
 ) -> tuple[float, float]:
     """Train for one epoch, return (avg edge loss, avg detection loss).
 
@@ -1219,6 +1236,7 @@ def train_epoch(
                 edge_logits, pair_target,
                 frame_det[i][2], frame_det[i + 1][2],
                 div_weight=div_weight,
+                logit_l2_weight=logit_l2_weight,
             ))
         edge_loss = sum(block_losses) / len(block_losses)
 
@@ -1268,14 +1286,29 @@ def evaluate(
     device: torch.device,
     pool_kernel_um: float = 5.0,
     div_weight: float = 1.0,
+    logit_l2_weight: float = 0.0,
 ) -> tuple[float, float, float]:
-    """Evaluate model using detect→match→predict (same path as training).
+    """Evaluate model using detect→match→predict (same path as training) and print L2 logit diagnostics.
 
     Returns (avg_loss, accuracy, node_recall).
     """
     model.eval()
     total_loss, correct, total, n_pairs = 0.0, 0, 0, 0
     gt_matched, gt_total = 0, 0
+
+    # Diagnostic statistics
+    total_focal_loss = 0.0
+    total_reg_loss = 0.0
+    logits_min = float('inf')
+    logits_max = float('-inf')
+    logits_sum = 0.0
+    logits_sq_sum = 0.0
+    logits_count = 0
+
+    total_unmatched_targets = 0
+    unmatched_assigned_to_dummy = 0
+    total_targets = 0
+    targets_assigned_to_real = 0
 
     for batch in loader:
         imgs = batch["imgs"].to(device, dtype=torch.float32, non_blocking=True)
@@ -1329,9 +1362,48 @@ def evaluate(
             for b in range(B):
                 ns_b = int(frame_det[i][2][b].sum().item())
                 nt_b = int(frame_det[i + 1][2][b].sum().item())
+                if ns_b == 0 or nt_b == 0:
+                    continue
+
+                l_b = pair_logits[b, :ns_b, :nt_b]
+                t_b = pair_target[b, :ns_b, :nt_b]
+
+                # Focal loss calculation (excluding L2)
+                focal_l_val = compute_loss(l_b, t_b, div_weight=div_weight, logit_l2_weight=0.0).item()
+                reg_l_val = l_b.pow(2).mean().item()
+
+                total_focal_loss += focal_l_val
+                total_reg_loss += reg_l_val
+
+                # Probability tracking for diagnostics
+                dummy_row = torch.zeros(1, nt_b, device=l_b.device, dtype=l_b.dtype)
+                logits_with_dummy = torch.cat([l_b, dummy_row], dim=0)
+                probs_with_dummy = torch.softmax(logits_with_dummy, dim=0)
+                probs = probs_with_dummy[:ns_b]
+                prob_dummy = probs_with_dummy[-1]
+
+                # Unmatched targets: columns j where t_b[:, j].sum() == 0
+                col_sums = t_b.sum(dim=0)
+                unmatched_mask = col_sums == 0
+                total_unmatched_targets += unmatched_mask.sum().item()
+                # Dummy is selected if it has the maximum probability/logit in the column (index ns_b)
+                selected_parent = probs_with_dummy.argmax(dim=0)
+                unmatched_assigned_to_dummy += ((selected_parent == ns_b)[unmatched_mask]).sum().item()
+
+                # Real targets mapping
+                total_targets += nt_b
+                max_real_prob, _ = probs.max(dim=0)
+                targets_assigned_to_real += (max_real_prob > 0.5).sum().item()
+
+                # Logits distribution
+                logits_min = min(logits_min, l_b.min().item())
+                logits_max = max(logits_max, l_b.max().item())
+                logits_sum += l_b.sum().item()
+                logits_sq_sum += l_b.pow(2).sum().item()
+                logits_count += l_b.numel()
+
                 pair_loss, pair_correct, pair_total = _evaluate_pair(
-                    pair_logits[b, :ns_b, :nt_b], pair_target[b, :ns_b, :nt_b],
-                    div_weight=div_weight,
+                    l_b, t_b, div_weight=div_weight, logit_l2_weight=logit_l2_weight
                 )
                 total_loss += pair_loss
                 correct += pair_correct
@@ -1339,7 +1411,35 @@ def evaluate(
                 n_pairs += 1
 
     node_recall = gt_matched / max(gt_total, 1)
-    return total_loss / max(n_pairs, 1), correct / max(total, 1), node_recall
+    avg_loss = total_loss / max(n_pairs, 1)
+    avg_acc = correct / max(total, 1)
+
+    avg_focal_loss = total_focal_loss / max(n_pairs, 1)
+    avg_reg_loss = total_reg_loss / max(n_pairs, 1)
+
+    if logits_count > 0:
+        logits_mean = logits_sum / logits_count
+        logits_variance = max(0.0, (logits_sq_sum / logits_count) - (logits_mean ** 2))
+        logits_std = np.sqrt(logits_variance)
+    else:
+        logits_min, logits_max, logits_mean, logits_std = 0, 0, 0, 0
+
+    pct_dummy = 100 * unmatched_assigned_to_dummy / max(total_unmatched_targets, 1)
+    pct_real = 100 * targets_assigned_to_real / max(total_targets, 1)
+
+    print(f"\n[Validation Diagnostics]")
+    print(f"  Focal Loss:           {avg_focal_loss:.6f}")
+    print(f"  Reg Loss (L2):        {avg_reg_loss:.6f}")
+    print(f"  Scaled Reg Loss:      {logit_l2_weight * avg_reg_loss:.6f}")
+    print(f"  Logits - min:         {logits_min:.4f}")
+    print(f"  Logits - max:         {logits_max:.4f}")
+    print(f"  Logits - mean:        {logits_mean:.4f}")
+    print(f"  Logits - std:         {logits_std:.4f}")
+    print(f"  Unmatched assigned to Dummy parent: {pct_dummy:.2f}% ({unmatched_assigned_to_dummy}/{total_unmatched_targets})")
+    print(f"  Targets assigned to a Real parent:  {pct_real:.2f}% ({targets_assigned_to_real}/{total_targets})")
+    print(flush=True)
+
+    return avg_loss, avg_acc, node_recall
 
 
 # =============================================================================
@@ -1376,6 +1476,7 @@ def train(
     output_dir: Path | None = None,
     div_weight: float = 1.0,
     sibling_aware: bool = True,
+    logit_l2_weight: float = 0.0,
 ) -> UNetNodeTransformer:
     """Train on one fold from a pre-computed splits file.
 
@@ -1583,11 +1684,15 @@ def train(
         edge_loss, det_loss = train_epoch(
             model, train_loader, optimizer, device, det_loss_weight, det_neg_weight,
             max_iters=max_iters, pool_kernel_um=pool_kernel_um, div_weight=div_weight,
+            logit_l2_weight=logit_l2_weight,
         )
         train_time = time.monotonic() - t0
 
         t0 = time.monotonic()
-        test_loss, test_acc, test_recall = evaluate(model, test_loader, device, pool_kernel_um=pool_kernel_um, div_weight=div_weight)
+        test_loss, test_acc, test_recall = evaluate(
+            model, test_loader, device, pool_kernel_um=pool_kernel_um, div_weight=div_weight,
+            logit_l2_weight=logit_l2_weight,
+        )
         test_time = time.monotonic() - t0
 
         score = test_acc * test_recall
@@ -1711,6 +1816,8 @@ def main() -> None:
                         help="Enable sibling-aware geometric features in the edge prediction pipeline (default: on).")
     parser.add_argument("--no-sibling-aware", dest="sibling_aware", action="store_false",
                         help="Disable sibling-aware geometric features.")
+    parser.add_argument("--logit-l2-weight", type=float, default=1e-5,
+                        help="Weight for logit L2 regularization (default: 1e-5).")
 
     args = parser.parse_args()
 
@@ -1753,6 +1860,7 @@ def main() -> None:
             seed=args.seed,
             div_weight=args.div_weight,
             sibling_aware=args.sibling_aware,
+            logit_l2_weight=args.logit_l2_weight,
         )
 
 
