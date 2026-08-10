@@ -86,17 +86,21 @@ def test_feature_construction_correctness():
     qe = qc.unsqueeze(2).expand(B, N_c, N_t1, H)
     ke = kk.unsqueeze(1).expand(B, N_c, N_t1, H)
     abs_diff = torch.abs(qe - ke)
-    raw_delta = cc.unsqueeze(2) - cc1.unsqueeze(1)
-    distance_sq = torch.sum(raw_delta ** 2, dim=-1, keepdim=True)
-    distance = torch.sqrt(distance_sq + 1e-12)
-    direction = raw_delta / (distance + 1e-8)
-    scaled_delta = raw_delta / 100.0
+    voxel_scale = cc.new_tensor([1.625, 0.40625, 0.40625])
+    delta_phys = (cc.unsqueeze(2) - cc1.unsqueeze(1)) * voxel_scale
+    D0 = 5.0
+    dist_sq_phys = torch.sum(delta_phys ** 2, dim=-1, keepdim=True)
+    dist_phys = torch.sqrt(dist_sq_phys + 1e-12)
+    norm_delta = delta_phys / D0
+    norm_dist = dist_phys / D0
+    dist_sq_bounded = dist_sq_phys / (dist_sq_phys + (D0 ** 2))
+    direction = delta_phys / (dist_phys + 1e-8)
     
     # Cosine similarity manual calculation
     cos_sim = F.cosine_similarity(qe, ke, dim=-1).unsqueeze(-1)
     
     expected = torch.cat([
-        qe, ke, abs_diff, scaled_delta, distance, distance_sq, direction, cos_sim
+        qe, ke, abs_diff, norm_delta, norm_dist, dist_sq_bounded, direction, cos_sim
     ], dim=-1)
     
     torch.testing.assert_close(features, expected, rtol=1e-5, atol=1e-5)
@@ -118,43 +122,45 @@ def test_sibling_feature_construction_correctness():
     # Parent is at [0, 0, 0]
     cc = torch.zeros(B, N_c, 3)
     # Targets are at:
-    # Target 0: [1, 0, 0] (distance 1.0)
-    # Target 1: [-1, 0, 0] (distance 1.0)
-    # Target 2: [0, 5, 0] (distance 5.0)
+    # Target 0: [1, 0, 0]
+    # Target 1: [-1, 0, 0]
+    # Target 2: [0, 5, 0]
     cc1 = torch.tensor([[[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 5.0, 0.0]]], dtype=torch.float32)
     
     features = model._build_pair_features(qc, kk, cc, cc1)
     
+    # In physical space: z_scale=1.625, y_scale=0.40625, x_scale=0.40625, D0=5.0
+    # Target 0: [1.625, 0, 0] -> dist = 1.625 um
+    # Target 1: [-1.625, 0, 0] -> dist = 1.625 um
+    # Target 2: [0, 2.03125, 0] -> dist = 2.03125 um
     # Sibling verification for target 0 (index 0):
-    # k1 is Target 0 (dist 1.0), k2 is Target 1 (dist 1.0).
+    # k1 is Target 0 (1.625 um), k2 is Target 1 (1.625 um).
     # Since j=0 is k1, its sibling is k2 (index 1).
-    # Sibling coordinate for j=0 is cc1[0, 1] = [-1, 0, 0].
-    # Midpoint of j=0 and sibling is (cc1[0, 0] + cc1[0, 1])/2 = [0, 0, 0].
-    # Midpoint error for j=0 is distance between parent [0,0,0] and midpoint [0,0,0] = 0.0.
-    # Angle between j=0 ([1,0,0]) and sibling ([-1,0,0]) is 180 deg (cos_theta = -1.0).
-    # Sibling distance to parent: 1.0.
-    # Sibling-sibling distance: 2.0.
-    # Symmetric distance difference: |1.0 - 1.0| = 0.0.
-    
-    # Features shape is (1, 1, 3, 3*16 + 14 = 62). Sibling features are the last 5 dimensions.
-    # Sibling features for target 0 (index 0):
+    # Midpoint of j=0 and sibling is [0, 0, 0].
+    # dist_mid = 0.0 / 5.0 = 0.0
+    # dist_ss = 3.25 / 5.0 = 0.65
+    # cos_theta = -1.0
+    # dist_diff = |1.625 - 1.625| / 5.0 = 0.0
+    # dist_sib = 1.625 / 5.0 = 0.325
     sib_features_j0 = features[0, 0, 0, -5:]
-    expected_j0 = torch.tensor([0.0, 2.0, -1.0, 0.0, 1.0], dtype=torch.float32)
+    expected_j0 = torch.tensor([0.0, 0.65, -1.0, 0.0, 0.325], dtype=torch.float32)
     torch.testing.assert_close(sib_features_j0, expected_j0, rtol=1e-4, atol=1e-4)
 
     # Sibling verification for target 2 (index 2):
-    # k1 is Target 0 (dist 1.0), k2 is Target 1 (dist 1.0).
-    # Since j=2 is not k1, its sibling is k1 (index 0).
-    # Sibling coordinate for j=2 is cc1[0, 0] = [1, 0, 0].
-    # Midpoint of j=2 and sibling is (cc1[0, 2] + cc1[0, 0])/2 = [0.5, 2.5, 0.0].
-    # Midpoint error for j=2 is distance from parent [0,0,0] to [0.5, 2.5, 0] = sqrt(0.25 + 6.25) = sqrt(6.5) = 2.5495.
-    # Sibling distance to parent: 1.0.
-    # Sibling-sibling distance: distance from [0,5,0] to [1,0,0] = sqrt(1 + 25) = sqrt(26) = 5.0990.
-    # Symmetric distance difference: |5.0 - 1.0| = 4.0.
-    # Angle: cos_theta = sum([0, 5, 0] * [1, 0, 0]) / (5.0 * 1.0) = 0.0.
+    # k1 is Target 0 (1.625 um).
+    # Sibling is Target 0: [1.625, 0, 0].
+    # Target 2 is [0, 2.03125, 0].
+    # Midpoint = [0.8125, 1.015625, 0].
+    # dist_mid = sqrt(0.8125^2 + 1.015625^2) / 5.0 = 1.300627 / 5.0 = 0.260125
+    # dist_ss = sqrt(1.625^2 + 2.03125^2) / 5.0 = 2.601254 / 5.0 = 0.520251
+    # cos_theta = 0.0
+    # dist_diff = |2.03125 - 1.625| / 5.0 = 0.40625 / 5.0 = 0.08125
+    # dist_sib = 1.625 / 5.0 = 0.325
     sib_features_j2 = features[0, 0, 2, -5:]
     import math
-    expected_j2 = torch.tensor([math.sqrt(6.5), math.sqrt(26.0), 0.0, 4.0, 1.0], dtype=torch.float32)
+    d_mid = math.sqrt(0.8125**2 + 1.015625**2) / 5.0
+    d_ss = math.sqrt(1.625**2 + 2.03125**2) / 5.0
+    expected_j2 = torch.tensor([d_mid, d_ss, 0.0, 0.08125, 0.325], dtype=torch.float32)
     torch.testing.assert_close(sib_features_j2, expected_j2, rtol=1e-4, atol=1e-4)
 
 def test_gradient_flow():

@@ -150,18 +150,31 @@ class SimpleNodeTransformer(nn.Module):
         # Absolute embedding difference
         abs_diff = torch.abs(qe - ke)
 
-        # Raw coordinate displacement
-        raw_delta = cc.unsqueeze(2) - cc1.unsqueeze(1)
+        # Convert raw voxel coordinates to physical coordinates (um)
+        # Voxel spacing: z = 1.625 um, y = 0.40625 um, x = 0.40625 um
+        voxel_scale = cc.new_tensor([1.625, 0.40625, 0.40625])
+        
+        # Physical displacement: (B, N_c, N_t1, 3)
+        delta_phys = (cc.unsqueeze(2) - cc1.unsqueeze(1)) * voxel_scale
+        
+        # Characteristic motion scale from empirical GT transitions: D0 = 5.0 um
+        D0 = 5.0
 
-        # Euclidean distance and squared distance (computed from raw_delta)
-        distance_sq = torch.sum(raw_delta ** 2, dim=-1, keepdim=True)
-        distance = torch.sqrt(distance_sq + 1e-12)
+        # Physical Euclidean distance and bounded squared distance
+        dist_sq_phys = torch.sum(delta_phys ** 2, dim=-1, keepdim=True)
+        dist_phys = torch.sqrt(dist_sq_phys + 1e-12)
 
-        # Unit direction vector (computed from raw_delta)
-        direction = raw_delta / (distance + eps)
+        # Normalized relative displacement (dz, dy, dx / D0)
+        norm_delta = delta_phys / D0
 
-        # Scaled relative displacement passed to MLP
-        scaled_delta = raw_delta / 100.0
+        # Normalized physical distance (d_phys / D0)
+        norm_dist = dist_phys / D0
+
+        # Bounded squared distance feature in [0, 1]
+        dist_sq_bounded = dist_sq_phys / (dist_sq_phys + (D0 ** 2))
+
+        # Unit direction vector in physical space
+        direction = delta_phys / (dist_phys + eps)
 
         # Cosine similarity of q and k
         cos_similarity = F.cosine_similarity(qe, ke, dim=-1).unsqueeze(-1)
@@ -171,9 +184,9 @@ class SimpleNodeTransformer(nn.Module):
             qe,
             ke,
             abs_diff,
-            scaled_delta,
-            distance,
-            distance_sq,
+            norm_delta,
+            norm_dist,
+            dist_sq_bounded,
             direction,
             cos_similarity
         ], dim=-1)
@@ -181,8 +194,8 @@ class SimpleNodeTransformer(nn.Module):
         if not getattr(self, "sibling_aware", False):
             return standard_features
 
-        # Sibling-aware geometric features computation (fully vectorized)
-        dist_matrix = distance.squeeze(-1)  # (B, N_c, N_t1)
+        # Sibling-aware geometric features computation in physical space
+        dist_matrix = dist_phys.squeeze(-1)  # (B, N_c, N_t1)
         
         # Get top-2 minimum distances and indices along target dimension
         top2_val, top2_idx = torch.topk(dist_matrix, k=2, dim=-1, largest=False)
@@ -200,29 +213,33 @@ class SimpleNodeTransformer(nn.Module):
         cc1_flat = cc1.reshape(-1, 3)
         cc1_sib = cc1_flat[flat_sib_idx].view(B, nc_i, n1, 3)
 
-        cc_exp = cc.unsqueeze(2).expand(-1, -1, n1, -1)
-        cc1_exp = cc1.unsqueeze(1).expand(-1, nc_i, -1, -1)
+        cc_phys = cc * voxel_scale
+        cc1_phys = cc1 * voxel_scale
+        cc1_sib_phys = cc1_sib * voxel_scale
 
-        # 1. Sibling distance to parent: d(i, j')
-        delta_sib = cc_exp - cc1_sib
-        dist_sib = torch.sqrt(torch.sum(delta_sib**2, dim=-1, keepdim=True) + 1e-12)
+        cc_exp_phys = cc_phys.unsqueeze(2).expand(-1, -1, n1, -1)
+        cc1_exp_phys = cc1_phys.unsqueeze(1).expand(-1, nc_i, -1, -1)
 
-        # 2. Sibling-sibling distance: d(j, j')
-        delta_ss = cc1_exp - cc1_sib
-        dist_ss = torch.sqrt(torch.sum(delta_ss**2, dim=-1, keepdim=True) + 1e-12)
+        # 1. Sibling distance to parent: d(i, j') / D0
+        delta_sib = cc_exp_phys - cc1_sib_phys
+        dist_sib = torch.sqrt(torch.sum(delta_sib**2, dim=-1, keepdim=True) + 1e-12) / D0
 
-        # 3. Midpoint distance: d(i, (j + j')/2)
-        midpoint = 0.5 * (cc1_exp + cc1_sib)
-        delta_mid = cc_exp - midpoint
-        dist_mid = torch.sqrt(torch.sum(delta_mid**2, dim=-1, keepdim=True) + 1e-12)
+        # 2. Sibling-sibling distance: d(j, j') / D0
+        delta_ss = cc1_exp_phys - cc1_sib_phys
+        dist_ss = torch.sqrt(torch.sum(delta_ss**2, dim=-1, keepdim=True) + 1e-12) / D0
 
-        # 4. Symmetric distance difference: |d(i, j) - d(i, j')|
-        dist_diff = torch.abs(distance - dist_sib)
+        # 3. Midpoint distance: d(i, (j + j')/2) / D0
+        midpoint = 0.5 * (cc1_exp_phys + cc1_sib_phys)
+        delta_mid = cc_exp_phys - midpoint
+        dist_mid = torch.sqrt(torch.sum(delta_mid**2, dim=-1, keepdim=True) + 1e-12) / D0
+
+        # 4. Symmetric distance difference: |d(i, j) - d(i, j')| / D0
+        dist_diff = torch.abs(norm_dist - dist_sib)
 
         # 5. Division angle cosine
-        v_child = cc1_exp - cc_exp
-        v_sib = cc1_sib - cc_exp
-        cos_theta = torch.sum(v_child * v_sib, dim=-1, keepdim=True) / (distance * dist_sib + 1e-8)
+        v_child = cc1_exp_phys - cc_exp_phys
+        v_sib = cc1_sib_phys - cc_exp_phys
+        cos_theta = torch.sum(v_child * v_sib, dim=-1, keepdim=True) / ((dist_phys * dist_sib * D0) + 1e-8)
 
         out = torch.cat([
             standard_features,
