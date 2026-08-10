@@ -1477,6 +1477,7 @@ def train(
     div_weight: float = 1.0,
     sibling_aware: bool = True,
     logit_l2_weight: float = 0.0,
+    gradient_checkpointing: bool = True,
 ) -> UNetNodeTransformer:
     """Train on one fold from a pre-computed splits file.
 
@@ -1602,10 +1603,12 @@ def train(
     elif device.type == "mps":
         print("Using Apple Metal Performance Shaders (MPS)", flush=True)
 
+    print(f"Gradient checkpointing: {'enabled' if gradient_checkpointing else 'disabled'}", flush=True)
     unet = TemporalUNet3D(
         in_channels=1,
         out_channels=unet_out_channels,
         layers=unet_layers,
+        gradient_checkpointing=gradient_checkpointing,
     )
     if unet_weights is not None:
         state = torch.load(unet_weights, map_location="cpu", weights_only=True)
@@ -1818,6 +1821,10 @@ def main() -> None:
                         help="Disable sibling-aware geometric features.")
     parser.add_argument("--logit-l2-weight", type=float, default=1e-5,
                         help="Weight for logit L2 regularization (default: 1e-5).")
+    parser.add_argument("--gradient-checkpointing", dest="gradient_checkpointing", action="store_true", default=True,
+                        help="Enable gradient checkpointing in UNet (default: on).")
+    parser.add_argument("--no-gradient-checkpointing", dest="gradient_checkpointing", action="store_false",
+                        help="Disable gradient checkpointing in UNet to speed up backward pass.")
 
     args = parser.parse_args()
 
@@ -1861,6 +1868,7 @@ def main() -> None:
             div_weight=args.div_weight,
             sibling_aware=args.sibling_aware,
             logit_l2_weight=args.logit_l2_weight,
+            gradient_checkpointing=args.gradient_checkpointing,
         )
 
 
