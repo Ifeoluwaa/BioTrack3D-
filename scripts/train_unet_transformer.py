@@ -66,7 +66,11 @@ def compute_loss(
     div_weight: float = 1.0,
     logit_l2_weight: float = 0.0,
 ) -> torch.Tensor:
-    """BCE on annotated rows and columns with a dummy parent for cell appearances + optional logit L2 regularization."""
+    """BCE on all valid candidate pairs with a dummy parent for cell appearances + optional logit L2 regularization."""
+    if logits.shape[0] == 0 or logits.shape[1] == 0:
+        reg_loss = logits.pow(2).mean() if logits.numel() > 0 else torch.tensor(0.0, device=logits.device)
+        return logit_l2_weight * reg_loss
+
     # Append a dummy parent row of zeros to logits -> shape: (N_t + 1, N_t1)
     dummy_logit_row = torch.zeros(1, logits.shape[1], device=logits.device, dtype=logits.dtype)
     logits_with_dummy = torch.cat([logits, dummy_logit_row], dim=0)
@@ -76,29 +80,18 @@ def compute_loss(
     dummy_target_row = (1.0 - col_sum).clamp(min=0.0, max=1.0)
     target_with_dummy = torch.cat([target, dummy_target_row], dim=0)
 
-    # Handle active masks (only calculate loss on annotated regions)
-    active_rows = target.sum(dim=1) > 0
-    active_cols = target.sum(dim=0) > 0
-    mask = active_rows.unsqueeze(1) | active_cols.unsqueeze(0)
-    if not mask.any():
-        focal_loss = torch.tensor(0.0, requires_grad=True, device=logits.device)
-    else:
-        # Extend mask to the dummy parent row for columns that have active entries
-        dummy_mask_row = mask.any(dim=0, keepdim=True)
-        mask_with_dummy = torch.cat([mask, dummy_mask_row], dim=0)
+    # Softmax over the N_t + 1 dimensions (columns sum to 1.0)
+    probs = torch.softmax(logits_with_dummy, dim=0)
+    bce = F.binary_cross_entropy(probs, target_with_dummy, reduction="none")
+    p_t = probs * target_with_dummy + (1 - probs) * (1 - target_with_dummy)
+    loss = ((1 - p_t) ** 2) * bce
 
-        # Softmax over the N_t + 1 dimensions (columns sum to 1.0)
-        probs = torch.softmax(logits_with_dummy, dim=0)
-        bce = F.binary_cross_entropy(probs, target_with_dummy, reduction="none")
-        p_t = probs * target_with_dummy + (1 - probs) * (1 - target_with_dummy)
-        loss = ((1 - p_t) ** 2) * bce
+    # Apply division weighting (upweight loss for dividing parents)
+    div_rows = target.sum(dim=1) > 1
+    weight = torch.ones_like(loss)
+    weight[:logits.shape[0]][div_rows] = div_weight
 
-        # Apply division weighting (upweight loss for dividing parents)
-        div_rows = target.sum(dim=1) > 1
-        weight = torch.ones_like(loss)
-        weight[:logits.shape[0]][div_rows] = div_weight
-
-        focal_loss = (loss * weight)[mask_with_dummy].mean()
+    focal_loss = (loss * weight).mean()
 
     # Logit L2 regularization (applied to all entries of raw logits, no mask, dummy row excluded)
     reg_loss = logits.pow(2).mean()
@@ -135,9 +128,7 @@ def _evaluate_pair(
     logit_l2_weight: float = 0.0,
 ) -> tuple[float, int, int]:
     """Per-pair evaluation. Returns (loss, correct, total)."""
-    active_rows = target.sum(dim=1) > 0
-    active_cols = target.sum(dim=0) > 0
-    if not active_rows.any():
+    if logits.shape[0] == 0 or logits.shape[1] == 0:
         return 0.0, 0, 0
 
     loss = compute_loss(logits, target, div_weight=div_weight, logit_l2_weight=logit_l2_weight).item()
@@ -149,9 +140,8 @@ def _evaluate_pair(
     probs = probs_with_dummy[:logits.shape[0]]  # real parent probabilities
     preds = (probs > 0.5).float()
 
-    mask = active_rows.unsqueeze(1) | active_cols.unsqueeze(0)
-    correct = (preds[mask] == target[mask]).sum().item()
-    total = mask.sum().item()
+    correct = (preds == target).sum().item()
+    total = target.numel()
 
     return loss, correct, total
 
