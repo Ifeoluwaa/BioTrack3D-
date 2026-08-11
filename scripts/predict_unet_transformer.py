@@ -67,7 +67,7 @@ class PredictConfig:
     # Detection
     det_threshold: float = 0.3
     det_tta: bool = True  # flip-xy TTA for detection logits
-    pool_kernel_um: float = 3.0  # max-pool kernel size in µm for detection peak extraction
+    pool_kernel_um: float = 5.0  # max-pool kernel size in µm for detection peak extraction
     # Edge filtering
     edge_activation: str = "softmax"  # "sigmoid" or "softmax"
     threshold: float = 0.5
