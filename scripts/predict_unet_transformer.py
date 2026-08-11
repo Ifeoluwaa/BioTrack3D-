@@ -527,8 +527,20 @@ def predict(
 ) -> None:
     """Run inference on the test split and save predictions as .geff files."""
     if debug_video is not None:
-        test_names = [debug_video.name]
-        data_dir = debug_video.parent
+        # debug_video is a concrete dataset path.
+        # Keep the actual path for loading, but use its stem for output naming.
+        debug_path = debug_video
+        data_dir = debug_path.parent
+
+        if debug_path.name.endswith(".geff"):
+            debug_name = debug_path.name[:-5]
+        elif debug_path.name.endswith(".zarr"):
+            debug_name = debug_path.name[:-5]
+        else:
+            debug_name = debug_path.name
+
+        test_names = [debug_name]
+
     else:
         if splits_file.exists():
             folds = json.loads(splits_file.read_text())
@@ -550,7 +562,6 @@ def predict(
             }]
 
         test_names = folds[fold]["test"]
-
         if video_slice is not None:
             test_names = test_names[video_slice]
     from dataspec import PREDICTIONS_PATH
@@ -573,7 +584,10 @@ def predict(
     )
 
     for name in tqdm(test_names, desc="Predicting", disable=not INTERACTIVE):
-        ds_path = data_dir / name
+        if debug_video is not None:
+            ds_path = debug_path
+        else:
+            ds_path = data_dir / name
         coords, edges = predict_video(
                 model, ds_path, device,
                 cfg=cfg,
