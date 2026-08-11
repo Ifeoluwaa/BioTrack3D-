@@ -467,10 +467,32 @@ def predict_video(
             raw = edge_logits_pair[0]
 
             if cfg.edge_activation == "softmax":
-            # Softmax is over real parents + a dummy parent with logit 0.
-            # For each target, select the single best real parent only if
-            # that parent beats the dummy. This matches the semantics of
-            # the dummy-parent formulation used during training.
+                # Diagnostic: inspect raw edge logits before dummy-parent filtering.
+                raw_np_diag = raw.detach().cpu().numpy()
+
+                print(
+                    f"[EDGE DIAG] shape={raw_np_diag.shape} "
+                    f"min={raw_np_diag.min():.4f} "
+                    f"max={raw_np_diag.max():.4f} "
+                    f"mean={raw_np_diag.mean():.4f} "
+                    f"positive={(raw_np_diag > 0).mean() * 100:.2f}%",
+                    flush=True,
+                )
+
+                max_per_child_diag = raw_np_diag.max(axis=0)
+
+                print(
+                    f"[EDGE DIAG] max-per-child: "
+                    f"min={max_per_child_diag.min():.4f} "
+                    f"mean={max_per_child_diag.mean():.4f} "
+                    f"max={max_per_child_diag.max():.4f}",
+                    flush=True,
+                )
+
+                # Softmax is over real parents + a dummy parent with logit 0.
+                # For each target, select the single best real parent only if
+                # that parent beats the dummy. This matches the semantics of
+                # the dummy-parent formulation used during training.
                 raw_np = raw.detach().cpu().numpy()
 
                 candidates = []
