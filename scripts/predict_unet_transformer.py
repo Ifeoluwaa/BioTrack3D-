@@ -196,7 +196,7 @@ def load_model(
         pool_radius=config.get("pool_radius", 0),
         pool_sigma=config.get("pool_sigma", None),
         attn_dim=config.get("attn_dim", None),
-        sibling_aware=config.get("sibling_aware", False),
+        sibling_aware=config.get("sibling_aware", True),
     )
     state = torch.load(weights_path, map_location=device, weights_only=True)
     model.load_state_dict(state)
@@ -467,20 +467,30 @@ def predict_video(
             raw = edge_logits_pair[0]
 
             if cfg.edge_activation == "softmax":
-                # The dummy parent has a fixed logit of 0.0.
-                # A real parent is eligible only when its raw logit
-                # beats the dummy (i.e. raw logit > 0).
+            # Softmax is over real parents + a dummy parent with logit 0.
+            # For each target, select the single best real parent only if
+            # that parent beats the dummy. This matches the semantics of
+            # the dummy-parent formulation used during training.
                 raw_np = raw.detach().cpu().numpy()
 
-                candidates = sorted(
-                    [
-                        (raw_np[i, j], i, j)
-                        for i in range(n_src)
-                        for j in range(n_tgt)
-                        if raw_np[i, j] > 0.0
-                    ],
-                    reverse=True,
-                )
+                candidates = []
+                for j in range(n_tgt):
+                    if n_src == 0:
+                        continue
+
+                    # Best real parent for this target.
+                    i = int(np.argmax(raw_np[:, j]))
+                    best_logit = float(raw_np[i, j])
+
+                    # Dummy parent has logit 0.0.
+                    # If the dummy wins, this target gets no real edge.
+                    if best_logit > 0.0:
+                        candidates.append((best_logit, i, j))
+
+                # Highest-confidence candidate edges first so that the
+                # parent/child constraints are applied greedily.
+                candidates.sort(reverse=True)
+
             else:
                 probs = torch.sigmoid(raw).cpu().numpy()
 
