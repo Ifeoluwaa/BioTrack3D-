@@ -470,35 +470,151 @@ def predict_video(
             else:
                 probs = torch.sigmoid(raw).cpu().numpy()
 
+            # ==============================================================
+            # M2: conservative mitosis-aware association
+            # ==============================================================
+
+            MITOSIS_PARENT_MAX_UM = 10.0
+            MITOSIS_DAUGHTER_MIN_UM = 5.0
+            MITOSIS_DAUGHTER_MAX_UM = 13.0
+            MITOSIS_BONUS = 0.05
+            MITOSIS_MIN_EDGE_PROB = 0.45
+
+            # p_coords_* have shape (1, n_nodes, 3).
+            # Remove the batch dimension and convert to physical units.
+            src_xyz = (
+                (p_coords_src * ds_arr_t)
+                .squeeze(0)
+                .detach()
+                .cpu()
+                .numpy()
+            )
+            tgt_xyz = (
+                (p_coords_tgt * ds_arr_t)
+                .squeeze(0)
+                .detach()
+                .cpu()
+                .numpy()
+            )
+
+            candidate_data = []
+
+            # --------------------------------------------------------------
+            # Build normal neural candidates first.
+            # --------------------------------------------------------------
+            for i in range(n_src):
+                for j in range(n_tgt):
+                    prob = float(probs[i, j])
+
+                    if prob <= cfg.threshold:
+                        continue
+
+                    dist = float(
+                        np.linalg.norm(
+                            src_xyz[i] - tgt_xyz[j]
+                        )
+                    )
+
+                    candidate_data.append({
+                        "prob": prob,
+                        "i": i,
+                        "j": j,
+                        "dist": dist,
+                        "score": prob,
+                    })
+
+            # --------------------------------------------------------------
+            # Find plausible sibling pairs for the same parent.
+            #
+            # We ONLY modify ranking scores. We never force an edge.
+            # --------------------------------------------------------------
+            by_parent: dict[int, list[dict]] = {}
+
+            for cand in candidate_data:
+                if cand["prob"] >= MITOSIS_MIN_EDGE_PROB:
+                    by_parent.setdefault(cand["i"], []).append(cand)
+
+            for i, parent_candidates in by_parent.items():
+
+                if len(parent_candidates) < 2:
+                    continue
+
+                for a in range(len(parent_candidates)):
+                    for b in range(a + 1, len(parent_candidates)):
+
+                        ca = parent_candidates[a]
+                        cb = parent_candidates[b]
+
+                        # Both parent -> daughter distances must be plausible.
+                        if ca["dist"] > MITOSIS_PARENT_MAX_UM:
+                            continue
+
+                        if cb["dist"] > MITOSIS_PARENT_MAX_UM:
+                            continue
+
+                        # Distance between the two proposed daughters.
+                        daughter_dist = float(
+                            np.linalg.norm(
+                                tgt_xyz[ca["j"]]
+                                - tgt_xyz[cb["j"]]
+                            )
+                        )
+
+                        if not (
+                            MITOSIS_DAUGHTER_MIN_UM
+                            <= daughter_dist
+                            <= MITOSIS_DAUGHTER_MAX_UM
+                        ):
+                            continue
+
+                        # Small bonus ONLY for ranking.
+                        ca["score"] += MITOSIS_BONUS
+                        cb["score"] += MITOSIS_BONUS
+
+            # --------------------------------------------------------------
+            # Preserve the original greedy association mechanism.
+            # --------------------------------------------------------------
             candidates = sorted(
                 [
-                    (probs[i, j], i, j)
-                    for i in range(n_src)
-                    for j in range(n_tgt)
-                    if probs[i, j] > cfg.threshold
+                    (
+                        c["score"],
+                        c["prob"],
+                        c["i"],
+                        c["j"],
+                        c["dist"],
+                    )
+                    for c in candidate_data
                 ],
                 reverse=True,
             )
+            
             children_count: dict[int, int] = {}
             parents_count: dict[int, int] = {}
 
-            for prob, i, j in candidates:
+            for score, prob, i, j, dist in candidates:
                 n_ch = children_count.get(i, 0)
                 n_pa = parents_count.get(j, 0)
-                if cfg.max_children_per_node is not None and n_ch >= cfg.max_children_per_node:
+
+                if (
+                    cfg.max_children_per_node is not None
+                    and n_ch >= cfg.max_children_per_node
+                ):
                     continue
-                if cfg.max_parents_per_node is not None and n_pa >= cfg.max_parents_per_node:
+
+                if (
+                    cfg.max_parents_per_node is not None
+                    and n_pa >= cfg.max_parents_per_node
+                ):
                     continue
 
                 gi, gj = int(idx_src[i]), int(idx_tgt[j])
-                dist = float(np.linalg.norm(
-                    coords_so_far[gi, 1:].astype(np.float32)
-                    - coords_so_far[gj, 1:].astype(np.float32)
-                ))
-                all_edges.append((gi, gj, float(prob), dist))
+
+                all_edges.append(
+                    (gi, gj, float(prob), float(dist))
+                )
+
                 children_count[i] = n_ch + 1
                 parents_count[j] = n_pa + 1
-
         del unet_out
 
     coords = np.concatenate(coord_lists) if coord_lists else np.empty((0, 4), dtype=np.int16)
@@ -617,7 +733,7 @@ def predict(
             "dir": output_dir,
             "geffs": sorted(output_dir.glob("*.geff")),
         }
-        results = evaluate_run(run)
+        results = evaluate_run(run, gt_dir=data_dir)
         s = summarise(results)
         print(
             f"Evaluation ({len(results)} videos): "

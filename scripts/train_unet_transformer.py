@@ -839,7 +839,29 @@ class UNetNodeTransformer(nn.Module):
         feat_tgt = torch.cat([unet_feat_tgt, pos_feat_tgt], dim=-1)
         return self.transformer(feat_src, feat_tgt, coords_src, coords_tgt, mask_src, mask_tgt)
 
+    def predict_divisions(
+        self,
+        unet_feat_src: torch.Tensor,
+        unet_feat_tgt: torch.Tensor,
+        coords_src: torch.Tensor,
+        coords_tgt: torch.Tensor,
+        pos_feat_src: torch.Tensor,
+        pos_feat_tgt: torch.Tensor,
+        mask_src: torch.Tensor,
+        mask_tgt: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run parent-level division predictor on pre-indexed UNet features."""
+        feat_src = torch.cat([unet_feat_src, pos_feat_src], dim=-1)
+        feat_tgt = torch.cat([unet_feat_tgt, pos_feat_tgt], dim=-1)
 
+        return self.transformer.predict_divisions(
+            feat_src,
+            feat_tgt,
+            coords_src,
+            coords_tgt,
+            mask_src,
+            mask_tgt,
+        )
 # =============================================================================
 # Detection loss
 # =============================================================================
@@ -1099,6 +1121,62 @@ def build_matched_edge_targets(
 # Training
 # =============================================================================
 
+def build_division_targets(
+    gt_target: torch.Tensor,
+    max_nodes: int,
+) -> torch.Tensor:
+    """Return one binary division target per parent node.
+
+    A parent is a division parent when it has more than one GT child
+    in the t -> t+1 transition matrix.
+    """
+    # gt_target: (B, N_t, N_t1)
+    division = (gt_target.sum(dim=2) > 1).float()
+
+    if division.shape[1] < max_nodes:
+        padded = torch.zeros(
+            division.shape[0],
+            max_nodes,
+            device=division.device,
+            dtype=division.dtype,
+        )
+        padded[:, :division.shape[1]] = division
+        return padded
+
+    return division[:, :max_nodes]
+
+def compute_division_loss(
+    division_logits: torch.Tensor,
+    division_target: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    """Binary classification loss for parent-level cell division."""
+    valid = mask.bool()
+
+    if not valid.any():
+        return torch.tensor(
+            0.0,
+            device=division_logits.device,
+            requires_grad=True,
+        )
+
+    logits = division_logits[valid]
+    target = division_target[valid]
+
+    # Division parents are rare, so compensate for class imbalance.
+    n_pos = target.sum().clamp(min=1.0)
+    n_neg = (target.numel() - target.sum()).clamp(min=1.0)
+
+    pos_weight = n_neg / n_pos
+
+    return F.binary_cross_entropy_with_logits(
+        logits,
+        target,
+        pos_weight=pos_weight,
+    )
+
+
+
 def train_epoch(
     model: UNetNodeTransformer,
     loader: DataLoader,
@@ -1109,23 +1187,36 @@ def train_epoch(
     max_iters: int | None = None,
     pool_kernel_um: float = 5.0,
     div_weight: float = 1.0,
-) -> tuple[float, float]:
-    """Train for one epoch, return (avg edge loss, avg detection loss).
+) -> tuple[float, float, float]:
+    """Train for one epoch.
 
-    When *max_iters* is set, the loader is cycled repeatedly until that many
-    iterations have been performed, regardless of dataset size.
+    Returns
+    -------
+    tuple
+        (average edge loss, average detection loss, average division loss)
     """
     model.train()
+
     total_edge_loss = 0.0
     total_det_loss = 0.0
     n_samples = 0
 
     if max_iters is not None:
         batch_iter = _cycle(loader)
-        pbar = tqdm(range(max_iters), desc="  iters", leave=False, disable=False)
+        pbar = tqdm(
+            range(max_iters),
+            desc="  iters",
+            leave=False,
+            disable=False,
+        )
     else:
         batch_iter = iter(loader)
-        pbar = tqdm(range(len(loader)), desc="  batches", leave=False, disable=False)
+        pbar = tqdm(
+            range(len(loader)),
+            desc="  batches",
+            leave=False,
+            disable=False,
+        )
 
     t_data, t_forward, t_backward = 0.0, 0.0, 0.0
     t0 = time.perf_counter()
@@ -1133,89 +1224,158 @@ def train_epoch(
     for _ in pbar:
         batch = next(batch_iter)
 
-        imgs = batch["imgs"].to(device, dtype=torch.float32, non_blocking=True)       # (B, W, *sp)
-        coords = batch["coords"].to(device, non_blocking=True)                         # (B, W, M, 3)
-        pos_feats = batch["pos_feats"].to(device, non_blocking=True)                   # (B, W, M, D)
-        masks = batch["masks"].to(device, non_blocking=True)                           # (B, W, M)
-        targets = batch["targets"].to(device, non_blocking=True)                       # (B, W-1, M, M)
+        imgs = batch["imgs"].to(
+            device, dtype=torch.float32, non_blocking=True
+        )
+        coords = batch["coords"].to(
+            device, non_blocking=True
+        )
+        pos_feats = batch["pos_feats"].to(
+            device, non_blocking=True
+        )
+        masks = batch["masks"].to(
+            device, non_blocking=True
+        )
+        targets = batch["targets"].to(
+            device, non_blocking=True
+        )
         image_shape = tuple(batch["image_shape"][0].tolist())
         voxel_size = tuple(batch["voxel_size"][0].tolist())
-        ds_scale = batch["downsample"][0].to(device)                                   # (3,)
+        ds_scale = batch["downsample"][0].to(device)
 
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+
         t1 = time.perf_counter()
         t_data += t1 - t0
 
         B, W = imgs.shape[:2]
 
-        # --- 1. Encode: UNet features + detection logits --------------------
+        # --- 1. Encode: UNet features + detection logits ----------------
         unet_out, det_logits = model.encode(imgs)
-        # unet_out: (B, W, C, *spatial),  det_logits: list of W × (B, 1, *spatial)
 
-        # --- 2. Detection loss over all W frames ---------------------------
+        # --- 2. Detection loss over all W frames ------------------------
         det_losses = [
             compute_detection_loss(
-                det_logits[i], coords[:, i], masks[:, i],
+                det_logits[i],
+                coords[:, i],
+                masks[:, i],
                 det_neg_weight,
             )
             for i in range(W)
         ]
         det_loss = sum(det_losses) / W
 
-        # --- 3. Per-frame detect → match → index UNet features -------------
-        frame_det: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor,
-                              list[torch.Tensor], torch.Tensor]] = []
+        # --- 3. Per-frame detect -> match -> index features --------------
+        frame_det = []
+
         for i in range(W):
             det_c, det_p, det_m, matches = detect_and_match(
-                det_logits[i], coords[:, i], masks[:, i],
+                det_logits[i],
+                coords[:, i],
+                masks[:, i],
                 image_shape,
                 voxel_size=voxel_size,
                 pool_kernel_um=pool_kernel_um,
-                frame_index=i, window_size=W,
+                frame_index=i,
+                window_size=W,
             )
-            unet_feat = model._index_features(
-                unet_out[:, i], det_c, det_m,
-            )
-            frame_det.append((det_c, det_p, det_m, matches, unet_feat))
 
-        # --- 4. Per-pair edge prediction and loss -------------------------
+            unet_feat = model._index_features(
+                unet_out[:, i],
+                det_c,
+                det_m,
+            )
+
+            frame_det.append(
+                (det_c, det_p, det_m, matches, unet_feat)
+            )
+
+        # --- 4. Edge + explicit division prediction --------------------
         block_losses = []
+
         for i in range(W - 1):
             ns = frame_det[i][0].shape[1]
             nt = frame_det[i + 1][0].shape[1]
-            pair_target = build_matched_edge_targets(
-                frame_det[i][3], frame_det[i + 1][3],
-                targets[:, i], ns, nt,
-            )
-            edge_logits = model.predict_edges(
-                frame_det[i][4], frame_det[i + 1][4],
-                frame_det[i][0] * ds_scale, frame_det[i + 1][0] * ds_scale,
-                frame_det[i][1], frame_det[i + 1][1],
-                frame_det[i][2], frame_det[i + 1][2],
-            )
-            block_losses.append(compute_batch_loss(
-                edge_logits, pair_target,
-                frame_det[i][2], frame_det[i + 1][2],
-                div_weight=div_weight,
-            ))
-        edge_loss = sum(block_losses) / len(block_losses)
 
-        # --- 5. Combined loss -----------------------------------------------
+            pair_target = build_matched_edge_targets(
+                frame_det[i][3],
+                frame_det[i + 1][3],
+                targets[:, i],
+                ns,
+                nt,
+            )
+
+            # Existing edge predictor
+            edge_logits = model.predict_edges(
+                frame_det[i][4],
+                frame_det[i + 1][4],
+                frame_det[i][0] * ds_scale,
+                frame_det[i + 1][0] * ds_scale,
+                frame_det[i][1],
+                frame_det[i + 1][1],
+                frame_det[i][2],
+                frame_det[i + 1][2],
+            )
+
+            block_losses.append(
+                compute_batch_loss(
+                    edge_logits,
+                    pair_target,
+                    frame_det[i][2],
+                    frame_det[i + 1][2],
+                    div_weight=div_weight,
+                )
+            )
+
+            # NEW: parent-level division prediction
+            """division_logits = model.predict_divisions(
+                frame_det[i][4],
+                frame_det[i + 1][4],
+                frame_det[i][0] * ds_scale,
+                frame_det[i + 1][0] * ds_scale,
+                frame_det[i][1],
+                frame_det[i + 1][1],
+                frame_det[i][2],
+                frame_det[i + 1][2],
+            )
+
+            # Parent is positive if it has >1 GT children.
+            division_target = build_division_targets(
+                targets[:, i],
+                ns,
+            )
+
+            division_losses.append(
+                compute_division_loss(
+                    division_logits,
+                    division_target,
+                    frame_det[i][2],
+                )
+            )"""
+
+        edge_loss = sum(block_losses) / len(block_losses)
         loss = edge_loss + det_loss_weight * det_loss
 
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+
         t2 = time.perf_counter()
         t_forward += t2 - t1
 
         optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+        torch.nn.utils.clip_grad_norm_(
+            model.parameters(),
+            1.0,
+        )
+
         optimizer.step()
 
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+
         t3 = time.perf_counter()
         t_backward += t3 - t2
 
@@ -1226,11 +1386,15 @@ def train_epoch(
         t0 = time.perf_counter()
 
     t_total = t_data + t_forward + t_backward
+
     if t_total > 0:
         print(
-            f"  [timing] data: {t_data:.1f}s ({100*t_data/t_total:.0f}%) | "
-            f"forward: {t_forward:.1f}s ({100*t_forward/t_total:.0f}%) | "
-            f"backward: {t_backward:.1f}s ({100*t_backward/t_total:.0f}%) | "
+            f"  [timing] data: {t_data:.1f}s "
+            f"({100*t_data/t_total:.0f}%) | "
+            f"forward: {t_forward:.1f}s "
+            f"({100*t_forward/t_total:.0f}%) | "
+            f"backward: {t_backward:.1f}s "
+            f"({100*t_backward/t_total:.0f}%) | "
             f"total: {t_total:.1f}s"
         )
 
@@ -1238,7 +1402,6 @@ def train_epoch(
         total_edge_loss / max(n_samples, 1),
         total_det_loss / max(n_samples, 1),
     )
-
 
 @torch.no_grad()
 def evaluate(

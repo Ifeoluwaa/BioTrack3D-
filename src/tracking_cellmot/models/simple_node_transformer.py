@@ -88,6 +88,14 @@ class SimpleNodeTransformer(nn.Module):
         ])
 
         self.norm_out = nn.LayerNorm(hidden_dim)
+        # Parent-level division classifier.
+# One logit per source/parent node: positive = likely mitosis.
+        self.division_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim // 2, 1),
+        )
 
         # MLP for pairwise scoring: concatenated features (q, k, |q-k|, rel_xyz, dist, dist^2, dir_xyz, cos_sim)
         # Sibling-aware geometry adds 5 extra features.
@@ -254,6 +262,50 @@ class SimpleNodeTransformer(nn.Module):
             out = out[:, :, :original_n1, :]
 
         return out
+
+
+    def predict_divisions(
+        self,
+        feat_t: torch.Tensor,
+        feat_t1: torch.Tensor,
+        coords_t: torch.Tensor,
+        coords_t1: torch.Tensor,
+        mask_t: torch.Tensor | None = None,
+        mask_t1: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Predict one division logit for each source/parent node.
+
+        Returns
+        -------
+        torch.Tensor
+            Shape (N_t,) for unbatched input or (B, N_t) for batched input.
+            Positive logits indicate increasing probability that the parent
+            divides into two children at t+1.
+        """
+        unbatched = feat_t.ndim == 2
+
+        if unbatched:
+            feat_t = feat_t.unsqueeze(0)
+            feat_t1 = feat_t1.unsqueeze(0)
+            coords_t = coords_t.unsqueeze(0)
+            coords_t1 = coords_t1.unsqueeze(0)
+
+        q = self.norm_in(self.proj(feat_t))
+        k = self.norm_in(self.proj(feat_t1))
+
+        # Same bidirectional context used by the edge predictor.
+        for block in self.blocks:
+            q = block(q, k, kv_mask=mask_t1)
+            k = block(k, q, kv_mask=mask_t)
+
+        q = self.norm_out(q)
+
+        division_logits = self.division_head(q).squeeze(-1)
+
+        if unbatched:
+            division_logits = division_logits.squeeze(0)
+
+        return division_logits
 
     def forward(
         self,

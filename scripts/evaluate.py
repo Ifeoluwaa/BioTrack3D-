@@ -108,13 +108,14 @@ def evaluate_pairs(
     return rows, skipped
 
 
-def evaluate_run(run: dict, max_distance: float = 7.0) -> list[dict]:
+def evaluate_run(run: dict, gt_dir: Path | str | None = None, max_distance: float = 7.0) -> list[dict]:
     """Score the predicted geffs in ``run['dir']`` against GT in ``DATASET_PATH``.
 
     Thin shim so ``scripts/predict_unet_transformer.py`` can evaluate a fresh
     prediction run right after inference.
     """
-    rows, _ = evaluate_pairs(run["dir"], DATASET_PATH, max_distance=max_distance)
+    gt_path = Path(gt_dir) if gt_dir is not None else DATASET_PATH
+    rows, _ = evaluate_pairs(run["dir"], gt_path, max_distance=max_distance)
     return rows
 
 
