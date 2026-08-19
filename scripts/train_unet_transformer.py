@@ -1125,18 +1125,30 @@ def build_division_targets(
     gt_target: torch.Tensor,
     max_nodes: int,
 ) -> torch.Tensor:
-    """Return one binary division target per parent node.
+    """Build parent-level division targets from annotated GT transitions.
 
-    A parent is a division parent when it has more than one GT child
-    in the t -> t+1 transition matrix.
+    A parent is labelled positive only when the GT transition matrix explicitly
+    shows >=2 children. Parents with 0 or 1 annotated child are treated as
+    UNKNOWN rather than negative, because the GT annotations are sparse.
     """
+
     # gt_target: (B, N_t, N_t1)
-    division = (gt_target.sum(dim=2) > 1).float()
+    child_count = gt_target.sum(dim=2)
+
+    # Positive only when >=2 children are explicitly annotated.
+    division = (child_count >= 2).float()
+
+    # Unknown parents: fewer than 2 annotated children.
+    # We encode these as -1 so compute_division_loss can ignore them.
+    division[child_count < 2] = -1.0
 
     if division.shape[1] < max_nodes:
-        padded = torch.zeros(
-            division.shape[0],
-            max_nodes,
+        padded = torch.full(
+            (
+                division.shape[0],
+                max_nodes,
+            ),
+            -1.0,
             device=division.device,
             dtype=division.dtype,
         )
@@ -1151,7 +1163,7 @@ def compute_division_loss(
     mask: torch.Tensor,
 ) -> torch.Tensor:
     """Binary classification loss for parent-level cell division."""
-    valid = mask.bool()
+    valid = mask.bool() & (division_target >= 0)
 
     if not valid.any():
         return torch.tensor(
@@ -1199,6 +1211,7 @@ def train_epoch(
 
     total_edge_loss = 0.0
     total_det_loss = 0.0
+    total_division_loss = 0.0
     n_samples = 0
 
     if max_iters is not None:
@@ -1293,6 +1306,8 @@ def train_epoch(
 
         # --- 4. Edge + explicit division prediction --------------------
         block_losses = []
+        division_losses = []
+        
 
         for i in range(W - 1):
             ns = frame_det[i][0].shape[1]
@@ -1328,8 +1343,8 @@ def train_epoch(
                 )
             )
 
-            # NEW: parent-level division prediction
-            """division_logits = model.predict_divisions(
+                       # Parent-level division prediction
+            division_logits = model.predict_divisions(
                 frame_det[i][4],
                 frame_det[i + 1][4],
                 frame_det[i][0] * ds_scale,
@@ -1341,10 +1356,8 @@ def train_epoch(
             )
 
             # Parent is positive if it has >1 GT children.
-            division_target = build_division_targets(
-                targets[:, i],
-                ns,
-            )
+            division_target = (pair_target.sum(dim=2) >= 2).float()
+
 
             division_losses.append(
                 compute_division_loss(
@@ -1352,10 +1365,16 @@ def train_epoch(
                     division_target,
                     frame_det[i][2],
                 )
-            )"""
+            )
 
         edge_loss = sum(block_losses) / len(block_losses)
-        loss = edge_loss + det_loss_weight * det_loss
+        division_loss = sum(division_losses) / len(division_losses)
+
+        loss = (
+            edge_loss
+            + det_loss_weight * det_loss
+            + div_weight * division_loss
+        )
 
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -1381,6 +1400,7 @@ def train_epoch(
 
         total_edge_loss += edge_loss.item() * B
         total_det_loss += det_loss.item() * B
+        total_division_loss += division_loss.item() * B
         n_samples += B
 
         t0 = time.perf_counter()
@@ -1399,9 +1419,10 @@ def train_epoch(
         )
 
     return (
-        total_edge_loss / max(n_samples, 1),
-        total_det_loss / max(n_samples, 1),
-    )
+    total_edge_loss / max(n_samples, 1),
+    total_det_loss / max(n_samples, 1),
+    total_division_loss / max(n_samples, 1),
+)
 
 @torch.no_grad()
 def evaluate(
@@ -1723,6 +1744,7 @@ def train(
                 "epoch",
                 "edge_loss",
                 "det_loss",
+                "division_loss",
                 "test_loss",
                 "accuracy",
                 "recall",
@@ -1731,7 +1753,7 @@ def train(
 
     for epoch in pbar:
         t0 = time.monotonic()
-        edge_loss, det_loss = train_epoch(
+        edge_loss, det_loss, division_loss = train_epoch(
             model, train_loader, optimizer, device, det_loss_weight, det_neg_weight,
             max_iters=max_iters, pool_kernel_um=pool_kernel_um, div_weight=div_weight,
         )
@@ -1777,6 +1799,7 @@ def train(
                 epoch + 1,
                 edge_loss,
                 det_loss,
+                division_loss,
                 test_loss,
                 test_acc,
                 test_recall,
@@ -1784,9 +1807,9 @@ def train(
             ])
 
         marker = "*" if is_best else " "
-        pbar.set_postfix(edge=f"{edge_loss:.4f}", det=f"{det_loss:.4f}", acc=f"{test_acc:.4f}")
+        pbar.set_postfix(edge=f"{edge_loss:.4f}", det=f"{det_loss:.4f}", div=f"{division_loss:.4f}",acc=f"{test_acc:.4f}")
         print(
-            f"  Epoch {epoch:3d}/{n_epochs} | edge={edge_loss:.4f} | det={det_loss:.4f} | "
+            f"  Epoch {epoch:3d}/{n_epochs} | edge={edge_loss:.4f} | det={det_loss:.4f} |  div={division_loss:.4f} |"
             f"test_loss={test_loss:.4f} | acc={test_acc:.4f} | recall={test_recall:.4f} | best={best_score:.4f} {marker} | "
             f"train={train_time:.1f}s test={test_time:.1f}s",
             flush=True,
@@ -1858,7 +1881,7 @@ def main() -> None:
                         help="Random seed for reproducibility.")
     parser.add_argument("--output-dir", type=str, default="weights/unet_transformer",
                         help="Directory to save checkpoint files.")
-    parser.add_argument("--div-weight", type=float, default=5.0,
+    parser.add_argument("--div-weight", type=float, default=1.0,
                         help="Loss weight multiplier for cell division edges.")
     parser.add_argument("--sibling-aware", dest="sibling_aware", action="store_true", default=True,
                         help="Enable sibling-aware geometric features in the edge prediction pipeline (default: on).")

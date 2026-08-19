@@ -465,6 +465,7 @@ def predict_video(
             )  # (1, n_src, n_tgt)
 
             raw = edge_logits_pair[0]
+         
             if cfg.edge_activation == "softmax":
                 probs = torch.softmax(raw, dim=0).cpu().numpy()
             else:
