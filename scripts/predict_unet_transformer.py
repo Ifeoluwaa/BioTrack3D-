@@ -106,7 +106,6 @@ def suppress_output():
         with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
             yield
 
-
 # =============================================================================
 # Graph building
 # =============================================================================
@@ -204,7 +203,249 @@ def load_model(
     model.eval()
     return model, config["window_size"], downsample
 
+# Division-aware post-processing.
+# Kept separate from the neural edge predictor so we can test the
+# biological hypothesis without retraining the model.
 
+# =============================================================================
+# Division-aware graph analysis
+# =============================================================================
+
+def find_division_candidates(
+    coords: np.ndarray,
+    edges: list[tuple[int, int, float, float]],
+    downsample: tuple[int, ...] = (1, 1, 1),
+    min_edge_prob: float = 0.5,
+    parent_max_um: float = 10.0,
+    daughter_min_um: float = 5.0,
+    daughter_max_um: float = 13.0,
+    min_persistence_prob: float = 0.3,
+) -> list[dict]:
+    """Find biologically plausible 1 -> 2 division events.
+
+    A division candidate requires:
+
+    1. One parent at frame t.
+    2. Two distinct daughters at frame t+1.
+    3. Both parent->daughter edges have reasonable probability.
+    4. Both parent->daughter distances are biologically plausible.
+    5. The daughters are spatially separated but still plausibly siblings.
+    6. Both daughters have evidence of continuing into t+2.
+
+    This is inference-time analysis only. It does not modify the neural model.
+    """
+
+    if not edges or len(coords) == 0:
+        return []
+    ds = np.asarray(downsample, dtype=np.float32)
+
+    # ------------------------------------------------------------------
+    # Organise edges by source node.
+    # ------------------------------------------------------------------
+    outgoing: dict[int, list[tuple[int, float, float]]] = {}
+
+    for src, tgt, prob, dist in edges:
+        if prob < min_edge_prob:
+            continue
+        outgoing.setdefault(src, []).append(
+            (tgt, float(prob), float(dist))
+        )
+
+    # Fast lookup for whether a node has a plausible outgoing continuation.
+    continuation_prob: dict[int, float] = {}
+
+    for src, tgt, prob, dist in edges:
+        if prob < min_persistence_prob:
+            continue
+
+        previous = continuation_prob.get(src, 0.0)
+        continuation_prob[src] = max(previous, float(prob))
+
+    candidates: list[dict] = []
+
+    # ------------------------------------------------------------------
+    # Examine each parent with at least two candidate children.
+    # ------------------------------------------------------------------
+    for parent_idx, child_edges in outgoing.items():
+        if len(child_edges) < 2:
+            continue
+
+        parent = coords[parent_idx]
+        parent_t = int(parent[0])
+
+        # Only consider candidates in the immediately following frame.
+        valid_children = []
+
+        for child_idx, prob, dist_from_edge in child_edges:
+            child = coords[child_idx]
+
+            if int(child[0]) != parent_t + 1:
+                continue
+
+            # Recompute physical parent->child distance from coordinates.
+            # coords are [t, z, y, x] in original-resolution voxel units.
+            delta = (
+                np.asarray(parent[1:], dtype=np.float32)
+                - np.asarray(child[1:], dtype=np.float32)
+            )
+
+            physical_delta = delta * ds * np.asarray(
+                [1.625, 0.40625, 0.40625],
+                dtype=np.float32,
+            )
+
+            physical_dist = float(np.linalg.norm(physical_delta))
+
+            if physical_dist > parent_max_um:
+                continue
+
+            valid_children.append(
+                {
+                    "idx": child_idx,
+                    "prob": float(prob),
+                    "dist": physical_dist,
+                }
+            )
+
+        if len(valid_children) < 2:
+            continue
+
+        # --------------------------------------------------------------
+        # Examine every possible daughter pair.
+        # --------------------------------------------------------------
+        for a in range(len(valid_children)):
+            for b in range(a + 1, len(valid_children)):
+                da = valid_children[a]
+                db = valid_children[b]
+
+                child_a = coords[da["idx"]]
+                child_b = coords[db["idx"]]
+
+                daughter_delta = (
+                    np.asarray(child_a[1:], dtype=np.float32)
+                    - np.asarray(child_b[1:], dtype=np.float32)
+                )
+
+                physical_daughter_delta = daughter_delta * ds * np.asarray(
+                    [1.625, 0.40625, 0.40625],
+                    dtype=np.float32,
+                )
+
+                daughter_distance = float(
+                    np.linalg.norm(physical_daughter_delta)
+                )
+
+                if not (
+                    daughter_min_um
+                    <= daughter_distance
+                    <= daughter_max_um
+                ):
+                    continue
+
+                # ------------------------------------------------------
+                # Symmetry: daughter distances from parent should be
+                # reasonably similar.
+                # ------------------------------------------------------
+                d1 = da["dist"]
+                d2 = db["dist"]
+
+                symmetry = abs(d1 - d2) / max(d1 + d2, 1e-6)
+
+                if symmetry > 0.75:
+                    continue
+
+                # ------------------------------------------------------
+                # Midpoint geometry.
+                # ------------------------------------------------------
+                midpoint = (
+                    np.asarray(child_a[1:], dtype=np.float32)
+                    + np.asarray(child_b[1:], dtype=np.float32)
+                ) / 2.0
+
+                midpoint_delta = (
+                    np.asarray(parent[1:], dtype=np.float32)
+                    - midpoint
+                )
+
+                midpoint_physical = midpoint_delta * ds * np.asarray(
+                    [1.625, 0.40625, 0.40625],
+                    dtype=np.float32,
+                )
+
+                midpoint_distance = float(
+                    np.linalg.norm(midpoint_physical)
+                )
+
+                # ------------------------------------------------------
+                # Daughter persistence into the following frame.
+                #
+                # We look for ANY plausible outgoing edge from each
+                # daughter. This is evidence that the daughter survives
+                # beyond the immediate division frame.
+                # ------------------------------------------------------
+                persist_a = continuation_prob.get(da["idx"], 0.0)
+                persist_b = continuation_prob.get(db["idx"], 0.0)
+
+                # ------------------------------------------------------
+                # Combined interpretable division score.
+                # ------------------------------------------------------
+                edge_score = 0.5 * (da["prob"] + db["prob"])
+
+                persistence_score = 0.5 * (
+                    persist_a + persist_b
+                )
+
+                geometry_score = (
+                    1.0
+                    - min(symmetry, 1.0)
+                )
+
+                division_score = (
+                    0.5 * edge_score
+                    + 0.3 * persistence_score
+                    + 0.2 * geometry_score
+                )
+
+                candidates.append(
+                    {
+                        "parent": int(parent_idx),
+                        "daughter1": int(da["idx"]),
+                        "daughter2": int(db["idx"]),
+
+                        "parent_coord": np.r_[
+                            coords[parent_idx, 0],
+                            coords[parent_idx, 1:] * ds,
+                        ].tolist(),
+
+                        "daughter1_coord": np.r_[
+                            coords[da["idx"], 0],
+                            coords[da["idx"], 1:] * ds,
+                        ].tolist(),
+
+                        "daughter2_coord": np.r_[
+                            coords[db["idx"], 0],
+                            coords[db["idx"], 1:] * ds,
+                        ].tolist(),
+
+                        "edge_prob1": float(da["prob"]),
+                        "edge_prob2": float(db["prob"]),
+                        "parent_dist1_um": float(d1),
+                        "parent_dist2_um": float(d2),
+                        "daughter_dist_um": float(daughter_distance),
+                        "symmetry": float(symmetry),
+                        "midpoint_dist_um": float(midpoint_distance),
+                        "persistence1": float(persist_a),
+                        "persistence2": float(persist_b),
+                        "division_score": float(division_score),
+                    }
+                )
+    # Highest-confidence division hypotheses first.
+    candidates.sort(
+        key=lambda x: x["division_score"],
+        reverse=True,
+    )
+
+    return candidates
 # =============================================================================
 # Per-frame loading
 # =============================================================================
@@ -349,10 +590,11 @@ def predict_video(
     global_node_count: int = 0
     all_edges: list[tuple[int, int, float, float]] = []
 
-    # Sliding windows with stride W-1 cover every consecutive pair exactly once.
+
     stride = max(W - 1, 1)
     window_starts = list(range(0, T - W + 1, stride))
     # Ensure the very last pair (T-2 → T-1) is covered.
+
     if not window_starts or window_starts[-1] + W < T:
         last = max(T - W, 0)
         if not window_starts or last != window_starts[-1]:
@@ -470,7 +712,7 @@ def predict_video(
                 probs = torch.softmax(raw, dim=0).cpu().numpy()
             else:
                 probs = torch.sigmoid(raw).cpu().numpy()
-
+                # ==============================================================
             # ==============================================================
             # M2: conservative mitosis-aware association
             # ==============================================================
@@ -497,6 +739,92 @@ def predict_video(
                 .cpu()
                 .numpy()
             )
+            # ==============================================================
+            # GT-division edge diagnostic for the known t=24 -> t=25 event
+            # ==============================================================
+
+            if t_src == 24 and t_tgt == 25:
+                gt_parent_zyx = np.array([45.0, 149.0, 247.0], dtype=np.float32)
+
+                parent_dists = np.linalg.norm(
+                    src_xyz - gt_parent_zyx,
+                    axis=1,
+                )
+                gt_parent_idx = int(np.argmin(parent_dists))
+
+                print("\n=== EDGE DIAGNOSTIC FOR GT PARENT ===", flush=True)
+                print(
+                    f"predicted parent index={gt_parent_idx} "
+                    f"coord={src_xyz[gt_parent_idx].tolist()} "
+                    f"GT_distance={parent_dists[gt_parent_idx]:.2f} original_voxels",
+                    flush=True,
+                )
+
+                # ==============================================================
+                # Explicit target-index mapping for the known GT division
+                # ==============================================================
+
+                gt_daughter1_zyx = np.array([45.0, 173.0, 238.0], dtype=np.float32)
+                gt_daughter2_zyx = np.array([46.0, 146.0, 246.0], dtype=np.float32)
+
+                target_dist_d1 = np.linalg.norm(
+                    tgt_xyz - gt_daughter1_zyx,
+                    axis=1,
+                )
+
+                target_dist_d2 = np.linalg.norm(
+                    tgt_xyz - gt_daughter2_zyx,
+                    axis=1,
+                )
+
+                daughter1_idx = int(np.argmin(target_dist_d1))
+                daughter2_idx = int(np.argmin(target_dist_d2))
+
+                same_location_dist = np.linalg.norm(
+                    tgt_xyz - src_xyz[gt_parent_idx],
+                    axis=1,
+                )
+
+                same_location_idx = int(np.argmin(same_location_dist))
+
+                print("\n=== EXPLICIT TARGET INDEX MAPPING ===", flush=True)
+
+                print(
+                    f"GT daughter 1 -> target_index={daughter1_idx} "
+                    f"coord={tgt_xyz[daughter1_idx].tolist()} "
+                    f"GT_distance={target_dist_d1[daughter1_idx]:.2f} voxels "
+                    f"edge_prob={float(probs[gt_parent_idx, daughter1_idx]):.6f}",
+                    flush=True,
+                )
+
+                print(
+                    f"GT daughter 2 -> target_index={daughter2_idx} "
+                    f"coord={tgt_xyz[daughter2_idx].tolist()} "
+                    f"GT_distance={target_dist_d2[daughter2_idx]:.2f} voxels "
+                    f"edge_prob={float(probs[gt_parent_idx, daughter2_idx]):.6f}",
+                    flush=True,
+                )
+
+                print(
+                    f"Same-location target -> target_index={same_location_idx} "
+                    f"coord={tgt_xyz[same_location_idx].tolist()} "
+                    f"parent_distance={same_location_dist[same_location_idx]:.2f} voxels "
+                    f"edge_prob={float(probs[gt_parent_idx, same_location_idx]):.6f}",
+                    flush=True,
+                )
+
+                print("\n=== TOP 10 TARGET INDICES ===", flush=True)
+
+                ranked = np.argsort(probs[gt_parent_idx])[::-1][:10]
+
+                for rank, j in enumerate(ranked, start=1):
+                    print(
+                        f"{rank:2d}. "
+                        f"target_index={int(j)} "
+                        f"coord={tgt_xyz[j].tolist()} "
+                        f"prob={float(probs[gt_parent_idx, j]):.6f}",
+                        flush=True,
+                    )
 
             candidate_data = []
 
@@ -617,12 +945,94 @@ def predict_video(
                 children_count[i] = n_ch + 1
                 parents_count[j] = n_pa + 1
         del unet_out
+    
+        # ==============================================================
+    # Diagnostic division analysis — does NOT modify all_edges.
+    # ==============================================================
+    division_candidates = find_division_candidates(
+        coords=np.concatenate(coord_lists) if coord_lists else np.empty((0, 4)),
+        edges=all_edges,
+        downsample=tuple(int(x) for x in ds_arr),
+        min_edge_prob=0.5,
+        parent_max_um=10.0,
+        daughter_min_um=5.0,
+        daughter_max_um=13.0,
+        min_persistence_prob=0.3,
+    )
 
+    if division_candidates:
+        division_t24 = [
+            cand
+            for cand in division_candidates
+            if int(cand["parent_coord"][0]) == 24
+        ]
+
+        print("\n=== DIVISION CANDIDATES AT t=24 ===", flush=True)
+
+        for k, cand in enumerate(division_t24[:20], start=1):
+            print(
+                f"{k}. parent={cand['parent']} "
+                f"daughters=({cand['daughter1']}, {cand['daughter2']}) "
+                f"parent_coord={cand['parent_coord']} "
+                f"daughter1_coord={cand['daughter1_coord']} "
+                f"daughter2_coord={cand['daughter2_coord']} "
+                f"edge_probs=({cand['edge_prob1']:.3f}, {cand['edge_prob2']:.3f}) "
+                f"parent_dists=({cand['parent_dist1_um']:.2f}, "
+                f"{cand['parent_dist2_um']:.2f}) um "
+                f"sibling_dist={cand['daughter_dist_um']:.2f} um "
+                f"symmetry={cand['symmetry']:.3f} "
+                f"persistence=({cand['persistence1']:.3f}, "
+                f"{cand['persistence2']:.3f}) "
+                f"score={cand['division_score']:.3f}",
+                flush=True,
+            )
+
+        if not division_t24:
+            print("No division candidates found at t=24.", flush=True)
+
+    else:
+        print("\n=== DIVISION CANDIDATES === none", flush=True)
     coords = np.concatenate(coord_lists) if coord_lists else np.empty((0, 4), dtype=np.int16)
     # Scale spatial coords back to original resolution.
     coords = coords.astype(np.float32)
     coords[:, 1:] *= ds_arr
     coords = coords.astype(np.int16)
+    gt_division = {
+        "parent": (24, np.array([45, 149, 247], dtype=np.float32)),
+        "daughter1": (25, np.array([45, 173, 238], dtype=np.float32)),
+        "daughter2": (25, np.array([46, 146, 246], dtype=np.float32)),
+    }
+
+    print("\n=== GT DIVISION DETECTION CHECK ===", flush=True)
+
+    for label, (gt_t, gt_zyx) in gt_division.items():
+        frame_mask = coords[:, 0] == gt_t
+        frame_coords = coords[frame_mask]
+
+        if len(frame_coords) == 0:
+            print(
+                f"{label}: NO predicted nodes at t={gt_t}",
+                flush=True,
+            )
+            continue
+
+        d = frame_coords[:, 1:].astype(np.float32) - gt_zyx
+        dist = np.linalg.norm(d, axis=1)
+
+        order = np.argsort(dist)[:5]
+
+        print(
+            f"{label}: GT t={gt_t}, GT_zyx={gt_zyx.tolist()}",
+            flush=True,
+        )
+
+        for rank, local_idx in enumerate(order, start=1):
+            print(
+                f"  #{rank}: "
+                f"pred={frame_coords[local_idx].tolist()} "
+                f"distance={float(dist[local_idx]):.2f}",
+                flush=True,
+            )
     return coords, all_edges
 
 

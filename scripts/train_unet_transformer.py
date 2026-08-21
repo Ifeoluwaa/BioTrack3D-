@@ -96,6 +96,84 @@ def compute_batch_loss(
         losses.append(compute_loss(logits[b, :nt, :nt1], target[b, :nt, :nt1], div_weight=div_weight))
     return torch.stack(losses).mean()
 
+def compute_division_consistency_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    mask_t: torch.Tensor,
+    mask_t1: torch.Tensor,
+    margin: float = 1.0,
+    hard_negatives: int = 4,
+) -> torch.Tensor:
+    """Directly train the edge scorer to recognize 1 -> 2 divisions.
+
+    For each GT dividing parent, the weaker of the two true daughter
+    logits should exceed the strongest false candidate by at least
+    ``margin``.
+
+    This operates directly on the raw edge logits, rather than on the
+    separate parent-level division classifier.
+    """
+    B = logits.shape[0]
+    losses = []
+
+    for b in range(B):
+        nt = int(mask_t[b].sum().item())
+        nt1 = int(mask_t1[b].sum().item())
+
+        if nt == 0 or nt1 == 0:
+            continue
+
+        row_logits = logits[b, :nt, :nt1]
+        row_target = target[b, :nt, :nt1]
+
+        # A division parent has >= 2 explicitly annotated children.
+        division_rows = row_target.sum(dim=1) >= 2
+
+        if not division_rows.any():
+            continue
+
+        for i in torch.nonzero(division_rows, as_tuple=False).flatten():
+            pos_mask = row_target[i] > 0
+            neg_mask = ~pos_mask
+
+            pos_logits = row_logits[i][pos_mask]
+            neg_logits = row_logits[i][neg_mask]
+
+            # Need at least two positives and at least one negative.
+            if pos_logits.numel() < 2 or neg_logits.numel() == 0:
+                continue
+
+            # Both true daughter edges must be strong.
+            positive_loss = F.binary_cross_entropy_with_logits(
+                pos_logits,
+                torch.ones_like(pos_logits),
+            )
+
+            # Focus on the hardest false candidates rather than every
+            # negative equally.
+            k = min(hard_negatives, neg_logits.numel())
+            hard_neg = torch.topk(
+                neg_logits,
+                k=k,
+                largest=True,
+            ).values
+
+            # Every selected false edge should sit below the weaker
+            # true daughter edge by at least ``margin``.
+            weakest_positive = pos_logits.min()
+            margin_loss = F.relu(
+                hard_neg - weakest_positive + margin
+            ).mean()
+
+            losses.append(
+                positive_loss + margin_loss
+            )
+
+    if not losses:
+        return logits.new_tensor(0.0, requires_grad=True)
+
+    return torch.stack(losses).mean()
+
 
 def _evaluate_pair(
     logits: torch.Tensor,
@@ -1199,19 +1277,22 @@ def train_epoch(
     max_iters: int | None = None,
     pool_kernel_um: float = 5.0,
     div_weight: float = 1.0,
-) -> tuple[float, float, float]:
+    div_consistency_weight: float = 0.5,
+) -> tuple[float, float, float, float]:
     """Train for one epoch.
 
     Returns
     -------
     tuple
-        (average edge loss, average detection loss, average division loss)
+        (average edge loss, average detection loss, average division loss,
+        average division consistency loss)
     """
     model.train()
 
     total_edge_loss = 0.0
     total_det_loss = 0.0
     total_division_loss = 0.0
+    total_division_consistency_loss = 0.0
     n_samples = 0
 
     if max_iters is not None:
@@ -1236,6 +1317,9 @@ def train_epoch(
 
     for _ in pbar:
         batch = next(batch_iter)
+
+        if batch["t_start"][0].item() == 24:
+            print("  >>> HIT TARGET MITOSIS WINDOW t=24->25", flush=True)
 
         imgs = batch["imgs"].to(
             device, dtype=torch.float32, non_blocking=True
@@ -1307,6 +1391,7 @@ def train_epoch(
         # --- 4. Edge + explicit division prediction --------------------
         block_losses = []
         division_losses = []
+        division_consistency_losses = []
         
 
         for i in range(W - 1):
@@ -1320,6 +1405,29 @@ def train_epoch(
                 ns,
                 nt,
             )
+            if batch["t_start"][0].item() == 24:
+                division_rows = (pair_target.sum(dim=2) >= 2)
+
+                print(
+                    f"  >>> TARGET WINDOW pair_target shape={tuple(pair_target.shape)} "
+                    f"division_rows={int(division_rows.sum().item())}",
+                    flush=True,
+                )
+
+                if division_rows.any():
+                    idx = torch.nonzero(division_rows, as_tuple=False)
+                    print(
+                        f"  >>> division parent indices={idx.tolist()}",
+                        flush=True,
+                    )
+
+            division_rows = (pair_target.sum(dim=2) >= 2).sum().item()
+
+            if division_rows > 0:
+                print(
+                    f"  [division batch] {int(division_rows)} annotated division parents",
+                    flush=True,
+                )
 
             # Existing edge predictor
             edge_logits = model.predict_edges(
@@ -1343,6 +1451,23 @@ def train_epoch(
                 )
             )
 
+
+            division_consistency_losses.append(
+                compute_division_consistency_loss(
+                    edge_logits,
+                    pair_target,
+                    frame_det[i][2],
+                    frame_det[i + 1][2],
+                )
+            )
+
+            if division_rows > 0:
+                print(
+                    f"  [division loss] consistency="
+                    f"{division_consistency_losses[-1].item():.6f}",
+                    flush=True,
+                )
+
                        # Parent-level division prediction
             division_logits = model.predict_divisions(
                 frame_det[i][4],
@@ -1356,7 +1481,10 @@ def train_epoch(
             )
 
             # Parent is positive if it has >1 GT children.
-            division_target = (pair_target.sum(dim=2) >= 2).float()
+            division_target = build_division_targets(
+                pair_target,
+                division_logits.shape[1],
+            )
 
 
             division_losses.append(
@@ -1370,10 +1498,16 @@ def train_epoch(
         edge_loss = sum(block_losses) / len(block_losses)
         division_loss = sum(division_losses) / len(division_losses)
 
+        division_consistency_loss = (
+            sum(division_consistency_losses)
+            / len(division_consistency_losses)
+        )
+
         loss = (
             edge_loss
             + det_loss_weight * det_loss
             + div_weight * division_loss
+            + div_consistency_weight * division_consistency_loss
         )
 
         if torch.cuda.is_available():
@@ -1401,6 +1535,9 @@ def train_epoch(
         total_edge_loss += edge_loss.item() * B
         total_det_loss += det_loss.item() * B
         total_division_loss += division_loss.item() * B
+        total_division_consistency_loss += (
+            division_consistency_loss.item() * B
+        )
         n_samples += B
 
         t0 = time.perf_counter()
@@ -1419,10 +1556,11 @@ def train_epoch(
         )
 
     return (
-    total_edge_loss / max(n_samples, 1),
-    total_det_loss / max(n_samples, 1),
-    total_division_loss / max(n_samples, 1),
-)
+        total_edge_loss / max(n_samples, 1),
+        total_det_loss / max(n_samples, 1),
+        total_division_loss / max(n_samples, 1),
+        total_division_consistency_loss / max(n_samples, 1),
+    )
 
 @torch.no_grad()
 def evaluate(
@@ -1640,7 +1778,7 @@ def train(
 
     
     train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True,
+        train_ds, batch_size=batch_size, shuffle=(debug_video is None),
         num_workers=num_workers, prefetch_factor=2 if num_workers > 0 else None,
         persistent_workers=num_workers > 0, pin_memory=False,
         generator=g, worker_init_fn=init_fn,
@@ -1745,6 +1883,7 @@ def train(
                 "edge_loss",
                 "det_loss",
                 "division_loss",
+                "division_consistency_loss",
                 "test_loss",
                 "accuracy",
                 "recall",
@@ -1753,9 +1892,16 @@ def train(
 
     for epoch in pbar:
         t0 = time.monotonic()
-        edge_loss, det_loss, division_loss = train_epoch(
-            model, train_loader, optimizer, device, det_loss_weight, det_neg_weight,
-            max_iters=max_iters, pool_kernel_um=pool_kernel_um, div_weight=div_weight,
+        edge_loss, det_loss, division_loss, division_consistency_loss = train_epoch(
+            model,
+            train_loader,
+            optimizer,
+            device,
+            det_loss_weight,
+            det_neg_weight,
+            max_iters=max_iters,
+            pool_kernel_um=pool_kernel_um,
+            div_weight=div_weight,
         )
         train_time = time.monotonic() - t0
 
@@ -1800,6 +1946,7 @@ def train(
                 edge_loss,
                 det_loss,
                 division_loss,
+                division_consistency_loss,
                 test_loss,
                 test_acc,
                 test_recall,
@@ -1809,7 +1956,7 @@ def train(
         marker = "*" if is_best else " "
         pbar.set_postfix(edge=f"{edge_loss:.4f}", det=f"{det_loss:.4f}", div=f"{division_loss:.4f}",acc=f"{test_acc:.4f}")
         print(
-            f"  Epoch {epoch:3d}/{n_epochs} | edge={edge_loss:.4f} | det={det_loss:.4f} |  div={division_loss:.4f} |"
+            f"  Epoch {epoch:3d}/{n_epochs} | edge={edge_loss:.4f} | det={det_loss:.4f} |  div={division_loss:.4f} | div_cons={division_consistency_loss:.4f} | "
             f"test_loss={test_loss:.4f} | acc={test_acc:.4f} | recall={test_recall:.4f} | best={best_score:.4f} {marker} | "
             f"train={train_time:.1f}s test={test_time:.1f}s",
             flush=True,
