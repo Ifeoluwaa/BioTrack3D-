@@ -1516,7 +1516,7 @@ def train_epoch(
         t2 = time.perf_counter()
         t_forward += t2 - t1
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         loss.backward()
 
         torch.nn.utils.clip_grad_norm_(
