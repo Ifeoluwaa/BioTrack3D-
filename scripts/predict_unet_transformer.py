@@ -118,7 +118,8 @@ def build_graph(
 
     Avoids ``add_node_attr_key`` to sidestep a tracksdata/Polars compatibility
     issue where the float default value is mistakenly used as a dtype.
-    Probabilities are passed as-is (softmax output, already in [0, 1]).
+    Probabilities are passed as-is; the normal inference path uses sigmoid
+edge probabilities in [0, 1].
     """
     graph = td.graph.InMemoryGraph()
 
@@ -216,7 +217,7 @@ def find_division_candidates(
     edges: list[tuple[int, int, float, float]],
     downsample: tuple[int, ...] = (1, 1, 1),
     min_edge_prob: float = 0.5,
-    parent_max_um: float = 10.0,
+    parent_max_um: float = 12.0,
     daughter_min_um: float = 5.0,
     daughter_max_um: float = 13.0,
     min_persistence_prob: float = 0.3,
@@ -526,11 +527,31 @@ def _detect_cells_pooled(
         (N, 4) int16 array with columns [t, z, y, x] in downsampled space.
     """
     logits = det_logits.unsqueeze(0)  # (1, 1, Z, Y, X)
-    pad = tuple(k // 2 for k in pool_kernel)
-    pooled = F.max_pool3d(logits, pool_kernel, stride=1, padding=pad)
-    is_peak = (logits == pooled) & (logits > det_threshold)
-    peak_idx = torch.nonzero(is_peak[0, 0])  # (N, 3)
 
+    # Detection threshold is defined as a probability, so convert logits
+    # before thresholding.
+    probs = torch.sigmoid(logits)
+
+    pad = tuple(
+        k // 2
+        for k in pool_kernel
+    )
+
+    pooled = F.max_pool3d(
+        probs,
+        pool_kernel,
+        stride=1,
+        padding=pad,
+    )
+
+    is_peak = (
+        (probs == pooled)
+        & (probs >= det_threshold)
+    )
+
+    peak_idx = torch.nonzero(
+        is_peak[0, 0]
+    )
     if peak_idx.shape[0] == 0:
         return np.empty((0, 4), dtype=np.int16)
 
@@ -554,7 +575,7 @@ def predict_video(
     """Run inference on a single video using sliding windows of W frames.
 
     Windows slide with stride ``W - 1`` so every consecutive pair is covered
-    exactly once.  UNet features from each window are reused for edge
+    exactly once. UNet features from each window are reused for edge
     prediction on all ``W - 1`` consecutive pairs within the window.
 
     Returns
@@ -563,168 +584,479 @@ def predict_video(
         Shape (N, 4) — columns [t, z, y, x] in original resolution.
     edges : list of (src_idx, tgt_idx, prob, distance) tuples
     """
-    ds = open_dataset(ds_path, normalize=False, load_image=False, downsample=downsample, require_tracks=use_gt_coords)
+    ds = open_dataset(
+        ds_path,
+        normalize=False,
+        load_image=False,
+        downsample=downsample,
+        require_tracks=use_gt_coords,
+    )
+
     if "0.001" not in ds.quantiles or "0.999" not in ds.quantiles:
-        raise ValueError(f"Zarr attrs missing image_statistics.quantiles for {ds_path}")
+        raise ValueError(
+            f"Zarr attrs missing image_statistics.quantiles for {ds_path}"
+        )
+
     zarr_arr = zarr.open_group(str(ds.zarr_path), mode="r")["0"]
+
     q_low = float(ds.quantiles["0.001"])
     q_high = float(ds.quantiles["0.999"])
 
-    T = ds.image_shape[0] if max_frames is None else min(ds.image_shape[0], max_frames)
+    T = (
+        ds.image_shape[0]
+        if max_frames is None
+        else min(ds.image_shape[0], max_frames)
+    )
+
     image_shape = (T,) + ds.image_shape[1:]
     target_shape = list(image_shape[1:])
 
-    ds_arr = np.array(downsample, dtype=np.float32)  # for coord rescaling at the end
-    ds_arr_t = torch.from_numpy(ds_arr).to(device)   # for predict_edges (original-space coords)
-    pos_feat_dim = 4 * _POS_EMBED_DIM
-    W = window_size
-    voxel_size = tuple(s * d for s, d in zip(ds.scale, downsample))
-    pool_k = pool_kernel_from_um(cfg.pool_kernel_um, voxel_size)
+    ds_arr = np.array(
+        downsample,
+        dtype=np.float32,
+    )
 
-    # Running node registry — each entry records the frame-t detections.
-    # coord_offset[t] = (start, end) half-open range into the stacked array.
+    ds_arr_t = torch.from_numpy(ds_arr).to(device)
+
+    pos_feat_dim = 4 * _POS_EMBED_DIM
+
+    W = window_size
+
+    voxel_size = tuple(
+        s * d
+        for s, d in zip(ds.scale, downsample)
+    )
+
+    pool_k = pool_kernel_from_um(
+        cfg.pool_kernel_um,
+        voxel_size,
+    )
+
+    # ------------------------------------------------------------------
+    # Running node registry.
+    # ------------------------------------------------------------------
     seen_frames: set[int] = set()
     seen_pairs: set[tuple[int, int]] = set()
+
     coord_lists: list[np.ndarray] = []
+
     coord_offset: dict[int, tuple[int, int]] = {}
+
     global_node_count: int = 0
-    all_edges: list[tuple[int, int, float, float]] = []
 
+    all_edges: list[
+        tuple[int, int, float, float]
+    ] = []
 
+    # ------------------------------------------------------------------
+    # Window layout.
+    # ------------------------------------------------------------------
     stride = max(W - 1, 1)
-    window_starts = list(range(0, T - W + 1, stride))
-    # Ensure the very last pair (T-2 → T-1) is covered.
 
-    if not window_starts or window_starts[-1] + W < T:
+    window_starts = list(
+        range(
+            0,
+            T - W + 1,
+            stride,
+        )
+    )
+
+    # Ensure the very last pair (T-2 -> T-1) is covered.
+    if (
+        not window_starts
+        or window_starts[-1] + W < T
+    ):
         last = max(T - W, 0)
-        if not window_starts or last != window_starts[-1]:
+
+        if (
+            not window_starts
+            or last != window_starts[-1]
+        ):
             window_starts.append(last)
 
+    # ==================================================================
+    # Sliding-window inference.
+    # ==================================================================
     for ws in tqdm(
         window_starts,
         desc="  windows",
         leave=False,
         disable=not INTERACTIVE,
     ):
-        frame_indices = list(range(ws, ws + W))
+        frame_indices = list(
+            range(ws, ws + W)
+        )
 
-        # --- UNet encode (single window, batch_size=1) ---
-        imgs = torch.stack([
-            _load_frame(zarr_arr, t, target_shape, downsample)
-            for t in frame_indices
-        ])  # (W, *spatial)
-        # Quantile normalisation (0.1%–99.9%) to match training pipeline.
-        imgs = ((imgs - q_low) / (q_high - q_low + 1e-6)).clamp(0.0)
-        imgs = imgs.unsqueeze(0).to(device)   # (1, W, *spatial)
+        # --------------------------------------------------------------
+        # UNet encode.
+        # --------------------------------------------------------------
+        imgs = torch.stack(
+            [
+                _load_frame(
+                    zarr_arr,
+                    t,
+                    target_shape,
+                    downsample,
+                )
+                for t in frame_indices
+            ]
+        )
+
+        # Quantile normalization.
+        imgs = (
+            (imgs - q_low)
+            / (q_high - q_low + 1e-6)
+        ).clamp(0.0)
+
+        imgs = imgs.unsqueeze(0).to(device)
 
         unet_out, det_logits = model.encode(imgs)
-        # unet_out: (1, W, C, *spatial_down), det_logits: list of W × (1, 1, *spatial_down)
 
-        # Detection TTA: original + flip-x + flip-y + flip-xy, average logits.
-        # TTA: flip along Y (-2) and X (-1) only.  Z is excluded because
-        # the data is highly anisotropic (Z resolution ~4x coarser than XY),
-        # so Z-flips would produce out-of-distribution inputs.
+        # --------------------------------------------------------------
+        # Detection TTA.
+        # --------------------------------------------------------------
         if cfg.det_tta:
-            tta_flips = [(-1,), (-2,), (-2, -1)]
+            tta_flips = [
+                (-1,),
+                (-2,),
+                (-2, -1),
+            ]
+
             for dims in tta_flips:
                 imgs_flip = imgs.flip(dims)
-                _, det_flip = model.encode(imgs_flip)
+
+                _, det_flip = model.encode(
+                    imgs_flip
+                )
+
                 for f in range(W):
-                    det_logits[f] = det_logits[f] + det_flip[f].flip(dims)
-                del imgs_flip, det_flip
+                    det_logits[f] = (
+                        det_logits[f]
+                        + det_flip[f].flip(dims)
+                    )
+
+                del imgs_flip
+                del det_flip
+
             for f in range(W):
-                det_logits[f] = det_logits[f] / 4
+                det_logits[f] = (
+                    det_logits[f] / 4
+                )
 
         del imgs
 
-        # --- Detect cells in each frame (dedup across windows) ---
+        # --------------------------------------------------------------
+        # Detect cells in each frame.
+        # --------------------------------------------------------------
         for f_idx, t in enumerate(frame_indices):
+
             if t not in seen_frames:
+
                 if use_gt_coords:
                     import polars as pl
-                    gt_t = ds.tracks.node_attrs().filter(pl.col("t") == t)
-                    coords_t = gt_t.select(["z", "y", "x"]).to_numpy().astype(np.float32) / ds_arr
-                    t_col = np.full((len(coords_t), 1), t, dtype=np.float32)
-                    arr = np.concatenate([t_col, coords_t], axis=1).astype(np.float32)
+
+                    gt_t = (
+                        ds.tracks
+                        .node_attrs()
+                        .filter(
+                            pl.col("t") == t
+                        )
+                    )
+
+                    coords_t = (
+                        gt_t
+                        .select(["z", "y", "x"])
+                        .to_numpy()
+                        .astype(np.float32)
+                        / ds_arr
+                    )
+
+                    t_col = np.full(
+                        (len(coords_t), 1),
+                        t,
+                        dtype=np.float32,
+                    )
+
+                    arr = np.concatenate(
+                        [
+                            t_col,
+                            coords_t,
+                        ],
+                        axis=1,
+                    ).astype(np.float32)
+
                 else:
                     arr = _detect_cells_pooled(
-                        det_logits[f_idx][0], t, cfg.det_threshold, pool_k,
+                        det_logits[f_idx][0],
+                        t,
+                        cfg.det_threshold,
+                        pool_k,
                     )
-                coord_offset[t] = (global_node_count, global_node_count + len(arr))
+                if len(arr) > 1:
+                    det_frame = det_logits[f_idx][0, 0]
+
+                    peak_scores = det_frame[
+                        arr[:, 1],
+                        arr[:, 2],
+                        arr[:, 3],
+                    ].detach().cpu().numpy()
+                    keep = np.ones(len(arr), dtype=bool)
+
+                    # Conservative same-frame deduplication.
+                    # Coordinates are still in downsampled voxel space here.
+                    dedup_radius_um = 3.5
+
+                    spatial_scale_um = np.asarray(
+                        [1.625, 0.40625, 0.40625],
+                        dtype=np.float32,
+                    ) * ds_arr
+
+                    order = np.argsort(
+                        peak_scores
+                    )[::-1]
+
+                    kept_indices = []
+
+                    for idx in order:
+                        if not keep[idx]:
+                            continue
+
+                        kept_indices.append(idx)
+
+                        delta_voxel = (
+                            arr[:, 1:].astype(np.float32)
+                            - arr[idx, 1:].astype(np.float32)
+                        )
+
+                        delta_um = (
+                            delta_voxel
+                            * spatial_scale_um
+                        )
+
+                        dist_um = np.linalg.norm(
+                            delta_um,
+                            axis=1,
+                        )
+
+                        duplicate_mask = (
+                            dist_um <= dedup_radius_um
+                        )
+
+                        duplicate_mask[idx] = False
+                        keep[duplicate_mask] = False
+
+                    arr = arr[
+                        np.array(
+                            sorted(kept_indices),
+                            dtype=np.int64,
+                        )
+                    ]
+
+                coord_offset[t] = (
+                    global_node_count,
+                    global_node_count + len(arr),
+                )
+
                 global_node_count += len(arr)
+
                 coord_lists.append(arr)
+
                 seen_frames.add(t)
 
         coords_so_far = (
-            np.concatenate(coord_lists) if coord_lists else np.empty((0, 4), dtype=np.int16)
+            np.concatenate(coord_lists)
+            if coord_lists
+            else np.empty(
+                (0, 4),
+                dtype=np.int16,
+            )
         )
 
-        # --- Edge prediction for each consecutive pair in the window ---
+        # ==============================================================
+        # Edge prediction for consecutive frame pairs.
+        # ==============================================================
         for f_idx in range(W - 1):
-            t_src, t_tgt = frame_indices[f_idx], frame_indices[f_idx + 1]
-            if (t_src, t_tgt) in seen_pairs:
-                continue
-            seen_pairs.add((t_src, t_tgt))
 
-            if t_src not in coord_offset or t_tgt not in coord_offset:
+            t_src = frame_indices[f_idx]
+            t_tgt = frame_indices[f_idx + 1]
+
+            if (
+                t_src,
+                t_tgt,
+            ) in seen_pairs:
                 continue
+
+            seen_pairs.add(
+                (
+                    t_src,
+                    t_tgt,
+                )
+            )
+
+            if (
+                t_src not in coord_offset
+                or t_tgt not in coord_offset
+            ):
+                continue
+
             s_src, e_src = coord_offset[t_src]
             s_tgt, e_tgt = coord_offset[t_tgt]
-            if e_src == s_src or e_tgt == s_tgt:
+
+            if (
+                e_src == s_src
+                or e_tgt == s_tgt
+            ):
                 continue
 
-            c_src = coords_so_far[s_src:e_src]
-            c_tgt = coords_so_far[s_tgt:e_tgt]
-            n_src, n_tgt = len(c_src), len(c_tgt)
-            idx_src = np.arange(s_src, e_src, dtype=np.int64)
-            idx_tgt = np.arange(s_tgt, e_tgt, dtype=np.int64)
+            c_src = coords_so_far[
+                s_src:e_src
+            ]
 
-            # Build tensors (batch_size=1).
-            p_coords_src = torch.from_numpy(c_src[:, 1:].astype(np.float32)).unsqueeze(0).to(device)
-            p_coords_tgt = torch.from_numpy(c_tgt[:, 1:].astype(np.float32)).unsqueeze(0).to(device)
-            # Use window-relative time (f_idx, f_idx+1) normalised by W, not absolute frame index.
-            window_shape = (W,) + image_shape[1:]
+            c_tgt = coords_so_far[
+                s_tgt:e_tgt
+            ]
+
+            n_src = len(c_src)
+            n_tgt = len(c_tgt)
+
+            idx_src = np.arange(
+                s_src,
+                e_src,
+                dtype=np.int64,
+            )
+
+            idx_tgt = np.arange(
+                s_tgt,
+                e_tgt,
+                dtype=np.int64,
+            )
+
+            # ----------------------------------------------------------
+            # Build tensors.
+            # ----------------------------------------------------------
+            p_coords_src = (
+                torch.from_numpy(
+                    c_src[:, 1:]
+                    .astype(np.float32)
+                )
+                .unsqueeze(0)
+                .to(device)
+            )
+
+            p_coords_tgt = (
+                torch.from_numpy(
+                    c_tgt[:, 1:]
+                    .astype(np.float32)
+                )
+                .unsqueeze(0)
+                .to(device)
+            )
+
+            # Use window-relative time.
+            window_shape = (
+                W,
+            ) + image_shape[1:]
+
             c_src_rel = c_src.copy()
             c_src_rel[:, 0] = f_idx
+
             c_tgt_rel = c_tgt.copy()
             c_tgt_rel[:, 0] = f_idx + 1
-            p_pos_src = torch.from_numpy(extract_pos_features(c_src_rel, window_shape)).unsqueeze(0).to(device)
-            p_pos_tgt = torch.from_numpy(extract_pos_features(c_tgt_rel, window_shape)).unsqueeze(0).to(device)
-            p_mask_src = torch.ones(1, n_src, dtype=torch.bool, device=device)
-            p_mask_tgt = torch.ones(1, n_tgt, dtype=torch.bool, device=device)
 
+            p_pos_src = (
+                torch.from_numpy(
+                    extract_pos_features(
+                        c_src_rel,
+                        window_shape,
+                    )
+                )
+                .unsqueeze(0)
+                .to(device)
+            )
+
+            p_pos_tgt = (
+                torch.from_numpy(
+                    extract_pos_features(
+                        c_tgt_rel,
+                        window_shape,
+                    )
+                )
+                .unsqueeze(0)
+                .to(device)
+            )
+
+            p_mask_src = torch.ones(
+                1,
+                n_src,
+                dtype=torch.bool,
+                device=device,
+            )
+
+            p_mask_tgt = torch.ones(
+                1,
+                n_tgt,
+                dtype=torch.bool,
+                device=device,
+            )
+
+            # ----------------------------------------------------------
+            # Index UNet features.
+            # ----------------------------------------------------------
             unet_feat_src = model._index_features(
-                unet_out[:, f_idx], p_coords_src, p_mask_src,
+                unet_out[:, f_idx],
+                p_coords_src,
+                p_mask_src,
             )
+
             unet_feat_tgt = model._index_features(
-                unet_out[:, f_idx + 1], p_coords_tgt, p_mask_tgt,
+                unet_out[:, f_idx + 1],
+                p_coords_tgt,
+                p_mask_tgt,
             )
+
+            # ----------------------------------------------------------
+            # Predict edge logits.
+            # ----------------------------------------------------------
             edge_logits_pair = model.predict_edges(
-                unet_feat_src, unet_feat_tgt,
-                p_coords_src * ds_arr_t, p_coords_tgt * ds_arr_t,
-                p_pos_src, p_pos_tgt,
-                p_mask_src, p_mask_tgt,
-            )  # (1, n_src, n_tgt)
+                unet_feat_src,
+                unet_feat_tgt,
+                p_coords_src * ds_arr_t,
+                p_coords_tgt * ds_arr_t,
+                p_pos_src,
+                p_pos_tgt,
+                p_mask_src,
+                p_mask_tgt,
+            )
 
             raw = edge_logits_pair[0]
-         
-            if cfg.edge_activation == "softmax":
-                probs = torch.softmax(raw, dim=0).cpu().numpy()
-            else:
-                probs = torch.sigmoid(raw).cpu().numpy()
-                # ==============================================================
-            # ==============================================================
-            # M2: conservative mitosis-aware association
-            # ==============================================================
 
-            MITOSIS_PARENT_MAX_UM = 10.0
+            if cfg.edge_activation == "softmax":
+                probs = (
+                    torch.softmax(
+                        raw,
+                        dim=0,
+                    )
+                    .cpu()
+                    .numpy()
+                )
+            else:
+                probs = (
+                    torch.sigmoid(raw)
+                    .cpu()
+                    .numpy()
+                )
+
+            # ==========================================================
+            # M2: conservative mitosis-aware association.
+            # ==========================================================
+            MITOSIS_PARENT_MAX_UM = 12.0
             MITOSIS_DAUGHTER_MIN_UM = 5.0
             MITOSIS_DAUGHTER_MAX_UM = 13.0
             MITOSIS_BONUS = 0.05
             MITOSIS_MIN_EDGE_PROB = 0.45
 
-            # p_coords_* have shape (1, n_nodes, 3).
-            # Remove the batch dimension and convert to physical units.
+            # p_coords_* are (1, n_nodes, 3).
+            # These are original-resolution voxel coordinates.
             src_xyz = (
                 (p_coords_src * ds_arr_t)
                 .squeeze(0)
@@ -732,6 +1064,7 @@ def predict_video(
                 .cpu()
                 .numpy()
             )
+
             tgt_xyz = (
                 (p_coords_tgt * ds_arr_t)
                 .squeeze(0)
@@ -739,153 +1072,123 @@ def predict_video(
                 .cpu()
                 .numpy()
             )
-            # ==============================================================
-            # GT-division edge diagnostic for the known t=24 -> t=25 event
-            # ==============================================================
 
-            if t_src == 24 and t_tgt == 25:
-                gt_parent_zyx = np.array([45.0, 149.0, 247.0], dtype=np.float32)
 
-                parent_dists = np.linalg.norm(
-                    src_xyz - gt_parent_zyx,
-                    axis=1,
-                )
-                gt_parent_idx = int(np.argmin(parent_dists))
-
-                print("\n=== EDGE DIAGNOSTIC FOR GT PARENT ===", flush=True)
-                print(
-                    f"predicted parent index={gt_parent_idx} "
-                    f"coord={src_xyz[gt_parent_idx].tolist()} "
-                    f"GT_distance={parent_dists[gt_parent_idx]:.2f} original_voxels",
-                    flush=True,
-                )
-
-                # ==============================================================
-                # Explicit target-index mapping for the known GT division
-                # ==============================================================
-
-                gt_daughter1_zyx = np.array([45.0, 173.0, 238.0], dtype=np.float32)
-                gt_daughter2_zyx = np.array([46.0, 146.0, 246.0], dtype=np.float32)
-
-                target_dist_d1 = np.linalg.norm(
-                    tgt_xyz - gt_daughter1_zyx,
-                    axis=1,
-                )
-
-                target_dist_d2 = np.linalg.norm(
-                    tgt_xyz - gt_daughter2_zyx,
-                    axis=1,
-                )
-
-                daughter1_idx = int(np.argmin(target_dist_d1))
-                daughter2_idx = int(np.argmin(target_dist_d2))
-
-                same_location_dist = np.linalg.norm(
-                    tgt_xyz - src_xyz[gt_parent_idx],
-                    axis=1,
-                )
-
-                same_location_idx = int(np.argmin(same_location_dist))
-
-                print("\n=== EXPLICIT TARGET INDEX MAPPING ===", flush=True)
-
-                print(
-                    f"GT daughter 1 -> target_index={daughter1_idx} "
-                    f"coord={tgt_xyz[daughter1_idx].tolist()} "
-                    f"GT_distance={target_dist_d1[daughter1_idx]:.2f} voxels "
-                    f"edge_prob={float(probs[gt_parent_idx, daughter1_idx]):.6f}",
-                    flush=True,
-                )
-
-                print(
-                    f"GT daughter 2 -> target_index={daughter2_idx} "
-                    f"coord={tgt_xyz[daughter2_idx].tolist()} "
-                    f"GT_distance={target_dist_d2[daughter2_idx]:.2f} voxels "
-                    f"edge_prob={float(probs[gt_parent_idx, daughter2_idx]):.6f}",
-                    flush=True,
-                )
-
-                print(
-                    f"Same-location target -> target_index={same_location_idx} "
-                    f"coord={tgt_xyz[same_location_idx].tolist()} "
-                    f"parent_distance={same_location_dist[same_location_idx]:.2f} voxels "
-                    f"edge_prob={float(probs[gt_parent_idx, same_location_idx]):.6f}",
-                    flush=True,
-                )
-
-                print("\n=== TOP 10 TARGET INDICES ===", flush=True)
-
-                ranked = np.argsort(probs[gt_parent_idx])[::-1][:10]
-
-                for rank, j in enumerate(ranked, start=1):
-                    print(
-                        f"{rank:2d}. "
-                        f"target_index={int(j)} "
-                        f"coord={tgt_xyz[j].tolist()} "
-                        f"prob={float(probs[gt_parent_idx, j]):.6f}",
-                        flush=True,
-                    )
-
+            # ==========================================================
+            # Build normal neural candidates.
+            # ==========================================================
             candidate_data = []
-
-            # --------------------------------------------------------------
-            # Build normal neural candidates first.
-            # --------------------------------------------------------------
             for i in range(n_src):
                 for j in range(n_tgt):
-                    prob = float(probs[i, j])
+
+                    prob = float(
+                        probs[i, j]
+                    )
 
                     if prob <= cfg.threshold:
                         continue
 
-                    dist = float(
-                        np.linalg.norm(
-                            src_xyz[i] - tgt_xyz[j]
+                    # Original-resolution voxel displacement.
+                    delta_voxel = (
+                        src_xyz[i]
+                        - tgt_xyz[j]
+                    )
+
+                    # Convert each spatial axis to physical units.
+                    physical_delta = (
+                        delta_voxel
+                        * np.asarray(
+                            [1.625, 0.40625, 0.40625],
+                            dtype=np.float32,
                         )
                     )
 
-                    candidate_data.append({
-                        "prob": prob,
-                        "i": i,
-                        "j": j,
-                        "dist": dist,
-                        "score": prob,
-                    })
+                    dist = float(
+                        np.linalg.norm(
+                            physical_delta
+                        )
+                    )
 
-            # --------------------------------------------------------------
-            # Find plausible sibling pairs for the same parent.
-            #
-            # We ONLY modify ranking scores. We never force an edge.
-            # --------------------------------------------------------------
-            by_parent: dict[int, list[dict]] = {}
+                    candidate_data.append(
+                        {
+                            "prob": prob,
+                            "i": i,
+                            "j": j,
+                            "dist": dist,
+                            "score": prob,
+                        }
+                    )
+
+            # ==========================================================
+            # Find plausible sibling pairs.
+            # ==========================================================
+            by_parent: dict[
+                int,
+                list[dict],
+            ] = {}
 
             for cand in candidate_data:
-                if cand["prob"] >= MITOSIS_MIN_EDGE_PROB:
-                    by_parent.setdefault(cand["i"], []).append(cand)
+                if (
+                    cand["prob"]
+                    >= MITOSIS_MIN_EDGE_PROB
+                ):
+                    by_parent.setdefault(
+                        cand["i"],
+                        [],
+                    ).append(cand)
 
-            for i, parent_candidates in by_parent.items():
+            for i, parent_candidates in (
+                by_parent.items()
+            ):
 
                 if len(parent_candidates) < 2:
                     continue
 
-                for a in range(len(parent_candidates)):
-                    for b in range(a + 1, len(parent_candidates)):
+                for a in range(
+                    len(parent_candidates)
+                ):
+                    for b in range(
+                        a + 1,
+                        len(parent_candidates),
+                    ):
 
                         ca = parent_candidates[a]
                         cb = parent_candidates[b]
 
-                        # Both parent -> daughter distances must be plausible.
-                        if ca["dist"] > MITOSIS_PARENT_MAX_UM:
+                        # --------------------------------------------------
+                        # Both parent -> daughter distances must be valid.
+                        # --------------------------------------------------
+                        if (
+                            ca["dist"]
+                            > MITOSIS_PARENT_MAX_UM
+                        ):
                             continue
 
-                        if cb["dist"] > MITOSIS_PARENT_MAX_UM:
+                        if (
+                            cb["dist"]
+                            > MITOSIS_PARENT_MAX_UM
+                        ):
                             continue
 
-                        # Distance between the two proposed daughters.
+                        # --------------------------------------------------
+                        # Daughter-to-daughter distance in physical units.
+                        # --------------------------------------------------
+                        daughter_delta_voxel = (
+                            tgt_xyz[ca["j"]]
+                            - tgt_xyz[cb["j"]]
+                        )
+
+                        physical_daughter_delta = (
+                            daughter_delta_voxel
+                            * np.asarray(
+                                [1.625, 0.40625, 0.40625],
+                                dtype=np.float32,
+                            )
+                        )
+
                         daughter_dist = float(
                             np.linalg.norm(
-                                tgt_xyz[ca["j"]]
-                                - tgt_xyz[cb["j"]]
+                                physical_daughter_delta
                             )
                         )
 
@@ -896,13 +1199,20 @@ def predict_video(
                         ):
                             continue
 
-                        # Small bonus ONLY for ranking.
-                        ca["score"] += MITOSIS_BONUS
-                        cb["score"] += MITOSIS_BONUS
+                        # --------------------------------------------------
+                        # Small ranking bonus only.
+                        # --------------------------------------------------
+                        ca["score"] += (
+                            MITOSIS_BONUS
+                        )
 
-            # --------------------------------------------------------------
-            # Preserve the original greedy association mechanism.
-            # --------------------------------------------------------------
+                        cb["score"] += (
+                            MITOSIS_BONUS
+                        )
+
+            # ==========================================================
+            # Preserve original greedy association mechanism.
+            # ==========================================================
             candidates = sorted(
                 [
                     (
@@ -916,127 +1226,125 @@ def predict_video(
                 ],
                 reverse=True,
             )
-            
+
             children_count: dict[int, int] = {}
             parents_count: dict[int, int] = {}
 
-            for score, prob, i, j, dist in candidates:
-                n_ch = children_count.get(i, 0)
-                n_pa = parents_count.get(j, 0)
 
-                if (
-                    cfg.max_children_per_node is not None
-                    and n_ch >= cfg.max_children_per_node
-                ):
-                    continue
+            # ----------------------------------------------------------
+            # Greedy edge selection.
+            # ----------------------------------------------------------
+            for (
+                score,
+                prob,
+                i,
+                j,
+                dist,
+            ) in candidates:
 
-                if (
-                    cfg.max_parents_per_node is not None
-                    and n_pa >= cfg.max_parents_per_node
-                ):
-                    continue
-
-                gi, gj = int(idx_src[i]), int(idx_tgt[j])
-
-                all_edges.append(
-                    (gi, gj, float(prob), float(dist))
+                n_ch = children_count.get(
+                    i,
+                    0,
                 )
 
-                children_count[i] = n_ch + 1
-                parents_count[j] = n_pa + 1
+                n_pa = parents_count.get(
+                    j,
+                    0,
+                )
+
+                if (
+                    cfg.max_children_per_node
+                    is not None
+                    and n_ch
+                    >= cfg.max_children_per_node
+                ):
+
+                    continue
+
+                if (
+                    cfg.max_parents_per_node
+                    is not None
+                    and n_pa
+                    >= cfg.max_parents_per_node
+                ):
+                    continue
+
+                gi = int(
+                    idx_src[i]
+                )
+
+                gj = int(
+                    idx_tgt[j]
+                )
+
+                all_edges.append(
+                    (
+                        gi,
+                        gj,
+                        float(prob),
+                        float(dist),
+                    )
+                )
+
+
+                children_count[i] = (
+                    n_ch + 1
+                )
+
+                parents_count[j] = (
+                    n_pa + 1
+                )
+
         del unet_out
-    
-        # ==============================================================
-    # Diagnostic division analysis — does NOT modify all_edges.
+
+    # ==============================================================
+    # Diagnostic division analysis.
+    # Does NOT modify all_edges.
     # ==============================================================
     division_candidates = find_division_candidates(
-        coords=np.concatenate(coord_lists) if coord_lists else np.empty((0, 4)),
+        coords=(
+            np.concatenate(coord_lists)
+            if coord_lists
+            else np.empty(
+                (0, 4)
+            )
+        ),
         edges=all_edges,
-        downsample=tuple(int(x) for x in ds_arr),
+        downsample=tuple(
+            int(x)
+            for x in ds_arr
+        ),
         min_edge_prob=0.5,
-        parent_max_um=10.0,
+        parent_max_um=12.0,
         daughter_min_um=5.0,
         daughter_max_um=13.0,
         min_persistence_prob=0.3,
     )
-
-    if division_candidates:
-        division_t24 = [
-            cand
-            for cand in division_candidates
-            if int(cand["parent_coord"][0]) == 24
-        ]
-
-        print("\n=== DIVISION CANDIDATES AT t=24 ===", flush=True)
-
-        for k, cand in enumerate(division_t24[:20], start=1):
-            print(
-                f"{k}. parent={cand['parent']} "
-                f"daughters=({cand['daughter1']}, {cand['daughter2']}) "
-                f"parent_coord={cand['parent_coord']} "
-                f"daughter1_coord={cand['daughter1_coord']} "
-                f"daughter2_coord={cand['daughter2_coord']} "
-                f"edge_probs=({cand['edge_prob1']:.3f}, {cand['edge_prob2']:.3f}) "
-                f"parent_dists=({cand['parent_dist1_um']:.2f}, "
-                f"{cand['parent_dist2_um']:.2f}) um "
-                f"sibling_dist={cand['daughter_dist_um']:.2f} um "
-                f"symmetry={cand['symmetry']:.3f} "
-                f"persistence=({cand['persistence1']:.3f}, "
-                f"{cand['persistence2']:.3f}) "
-                f"score={cand['division_score']:.3f}",
-                flush=True,
-            )
-
-        if not division_t24:
-            print("No division candidates found at t=24.", flush=True)
-
-    else:
-        print("\n=== DIVISION CANDIDATES === none", flush=True)
-    coords = np.concatenate(coord_lists) if coord_lists else np.empty((0, 4), dtype=np.int16)
-    # Scale spatial coords back to original resolution.
-    coords = coords.astype(np.float32)
-    coords[:, 1:] *= ds_arr
-    coords = coords.astype(np.int16)
-    gt_division = {
-        "parent": (24, np.array([45, 149, 247], dtype=np.float32)),
-        "daughter1": (25, np.array([45, 173, 238], dtype=np.float32)),
-        "daughter2": (25, np.array([46, 146, 246], dtype=np.float32)),
-    }
-
-    print("\n=== GT DIVISION DETECTION CHECK ===", flush=True)
-
-    for label, (gt_t, gt_zyx) in gt_division.items():
-        frame_mask = coords[:, 0] == gt_t
-        frame_coords = coords[frame_mask]
-
-        if len(frame_coords) == 0:
-            print(
-                f"{label}: NO predicted nodes at t={gt_t}",
-                flush=True,
-            )
-            continue
-
-        d = frame_coords[:, 1:].astype(np.float32) - gt_zyx
-        dist = np.linalg.norm(d, axis=1)
-
-        order = np.argsort(dist)[:5]
-
-        print(
-            f"{label}: GT t={gt_t}, GT_zyx={gt_zyx.tolist()}",
-            flush=True,
+    # ==============================================================
+    # Final coordinate stack.
+    # ==============================================================
+    coords = (
+        np.concatenate(coord_lists)
+        if coord_lists
+        else np.empty(
+            (0, 4),
+            dtype=np.int16,
         )
+    )
 
-        for rank, local_idx in enumerate(order, start=1):
-            print(
-                f"  #{rank}: "
-                f"pred={frame_coords[local_idx].tolist()} "
-                f"distance={float(dist[local_idx]):.2f}",
-                flush=True,
-            )
+    # Scale spatial coords back to original resolution.
+    coords = coords.astype(
+        np.float32
+    )
+
+    coords[:, 1:] *= ds_arr
+
+    coords = coords.astype(
+        np.int16
+    )
+
     return coords, all_edges
-
-
-# =============================================================================
+    # =============================================================================
 # Prediction loop
 # =============================================================================
 
@@ -1123,6 +1431,7 @@ def predict(
                 downsample=downsample,
             )
         graph = build_graph(coords, edges)
+    
         if cfg.use_ilp and graph.num_edges() > 0:
             solver = td.solvers.ILPSolver(
                 edge_weight=cfg.ilp_edge_weight * td.EdgeAttr("edge_prob"),
@@ -1132,6 +1441,7 @@ def predict(
             )
             with suppress_output():
                 graph = solver.solve(graph)
+              
         save_graph(graph, output_dir / f"{name}.geff")
 
     print(f"Saved {len(test_names)} predictions to {output_dir}", flush=True)

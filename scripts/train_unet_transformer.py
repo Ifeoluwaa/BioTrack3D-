@@ -60,25 +60,71 @@ def compute_gt_transition_matrix(
     return matrix
 
 
-def compute_loss(logits: torch.Tensor, target: torch.Tensor, div_weight: float = 1.0) -> torch.Tensor:
-    """BCE on annotated rows and columns (sparse GT — unannotated cells ignored)."""
+def compute_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    div_weight: float = 1.0,
+) -> torch.Tensor:
+    """Independent-edge focal BCE loss on explicitly supervised regions.
+
+    Edge logits are interpreted independently:
+        probability = sigmoid(logit)
+
+    This matches inference, where edge probabilities are also obtained
+    with sigmoid. Sparse/unannotated regions outside active rows/columns
+    are ignored by ``mask``.
+    """
     active_rows = target.sum(dim=1) > 0
     active_cols = target.sum(dim=0) > 0
-    mask = active_rows.unsqueeze(1) | active_cols.unsqueeze(0)
+
+    mask = (
+        active_rows.unsqueeze(1)
+        | active_cols.unsqueeze(0)
+    )
+
     if not mask.any():
-        return torch.tensor(0.0, requires_grad=True, device=logits.device)
+        return torch.tensor(
+            0.0,
+            requires_grad=True,
+            device=logits.device,
+        )
 
-    probs = torch.softmax(logits, dim=0)  # dim=0 intentional: divisions allowed, merges aren't
-    bce = F.binary_cross_entropy(probs, target, reduction="none")
-    p_t = probs * target + (1 - probs) * (1 - target)
-    loss = ((1 - p_t) ** 2) * bce
+    # IMPORTANT:
+    # Train directly on logits and let BCEWithLogitsLoss handle the
+    # sigmoid internally. This keeps training mathematically aligned
+    # with sigmoid-based inference.
+    bce = F.binary_cross_entropy_with_logits(
+        logits,
+        target,
+        reduction="none",
+    )
 
+    # Focal-style weighting using sigmoid probabilities.
+    probs = torch.sigmoid(logits)
+
+    p_t = (
+        probs * target
+        + (1.0 - probs) * (1.0 - target)
+    )
+
+    focal_weight = (
+        1.0 - p_t
+    ).pow(2)
+
+    loss = (
+        focal_weight
+        * bce
+    )
+
+    # Give annotated division rows optional extra weight.
     div_rows = target.sum(dim=1) > 1
+
     weight = torch.ones_like(loss)
     weight[div_rows] = div_weight
 
-    return (loss * weight)[mask].mean()
-
+    return (
+        loss * weight
+    )[mask].mean()
 
 def compute_batch_loss(
     logits: torch.Tensor,
@@ -96,6 +142,169 @@ def compute_batch_loss(
         losses.append(compute_loss(logits[b, :nt, :nt1], target[b, :nt, :nt1], div_weight=div_weight))
     return torch.stack(losses).mean()
 
+def diagnose_edge_ranking(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    coords_t: torch.Tensor,
+    coords_t1: torch.Tensor,
+    mask_t: torch.Tensor,
+    mask_t1: torch.Tensor,
+    max_distance_um: float = 15.0,
+    max_examples: int = 5,
+) -> None:
+    """Print true-edge ranking against the hardest explicit negatives.
+
+    This is diagnostic only. It does not modify gradients or training.
+    """
+    with torch.no_grad():
+        B = logits.shape[0]
+        printed = 0
+
+        for b in range(B):
+            nt = int(mask_t[b].sum().item())
+            nt1 = int(mask_t1[b].sum().item())
+
+            if nt == 0 or nt1 == 0:
+                continue
+
+            row_logits = logits[b, :nt, :nt1]
+            row_target = target[b, :nt, :nt1]
+            row_probs = torch.sigmoid(row_logits)
+
+            
+            positive_rows = torch.nonzero(
+                row_target.sum(dim=1) > 0,
+                as_tuple=False,
+            ).flatten()
+
+            for i in positive_rows:
+                pos_mask = row_target[i] > 0
+                neg_mask = row_target[i] == 0
+
+                src_xyz = coords_t[b, :nt, :].float()
+                tgt_xyz = coords_t1[b, :nt1, :].float()
+
+                delta = (
+                    src_xyz[i].unsqueeze(0)
+                    - tgt_xyz
+                )
+
+                physical_scale = torch.tensor(
+                    [1.625, 0.40625, 0.40625],
+                    device=delta.device,
+                    dtype=delta.dtype,
+                )
+
+                dist_um = torch.linalg.norm(
+                    delta * physical_scale,
+                    dim=1,
+                )
+
+                plausible_mask = (
+                    neg_mask
+                    & (dist_um <= max_distance_um)
+                )
+
+                if not pos_mask.any() or not plausible_mask.any():
+                    continue
+                pos_indices = torch.nonzero(
+                    pos_mask,
+                    as_tuple=False,
+                ).flatten()
+
+                neg_indices = torch.nonzero(
+                    plausible_mask,
+                    as_tuple=False,
+                ).flatten()
+
+                # Rank all targets by raw edge logit.
+                order = torch.argsort(
+                    row_logits[i],
+                    descending=True,
+                )
+
+                true_ranks = []
+
+                for j in pos_indices:
+                    rank = (
+                        (order == j).nonzero(
+                            as_tuple=False
+                        )[0, 0]
+                        .item()
+                        + 1
+                    )
+                    true_ranks.append(rank)
+
+                hardest_neg_local = neg_indices[
+                    torch.argmax(
+                        row_logits[i][neg_indices]
+                    )
+                ]
+
+                weakest_pos_local = pos_indices[
+                    torch.argmin(
+                        row_logits[i][pos_indices]
+                    )
+                ]
+
+                weakest_pos_logit = row_logits[
+                    i, weakest_pos_local
+                ]
+
+                hardest_neg_logit = row_logits[
+                    i, hardest_neg_local
+                ]
+
+                margin = (
+                    weakest_pos_logit
+                    - hardest_neg_logit
+                )
+
+                print(
+                    "\n[edge ranking]",
+                    flush=True,
+                )
+                print(
+                    f"  source={i.item()}",
+                    flush=True,
+                )
+                print(
+                    f"  true_targets="
+                    f"{pos_indices.cpu().tolist()}",
+                    flush=True,
+                )
+                print(
+                    f"  true_ranks="
+                    f"{true_ranks}",
+                    flush=True,
+                )
+                print(
+                    f"  weakest_true_logit="
+                    f"{float(weakest_pos_logit):.6f} "
+                    f"prob="
+                    f"{float(torch.sigmoid(weakest_pos_logit)):.6f}",
+                    flush=True,
+                )
+                print(
+                    f"  hardest_negative="
+                    f"{hardest_neg_local.item()} "
+                    f"logit="
+                    f"{float(hardest_neg_logit):.6f} "
+                    f"prob="
+                    f"{float(torch.sigmoid(hardest_neg_logit)):.6f}",
+                    flush=True,
+                )
+                print(
+                    f"  margin="
+                    f"{float(margin):.6f}",
+                    flush=True,
+                )
+
+                printed += 1
+
+                if printed >= max_examples:
+                    return
+
 def compute_division_consistency_loss(
     logits: torch.Tensor,
     target: torch.Tensor,
@@ -103,6 +312,7 @@ def compute_division_consistency_loss(
     mask_t1: torch.Tensor,
     margin: float = 1.0,
     hard_negatives: int = 4,
+    negative_weight: float = 2.0,
 ) -> torch.Tensor:
     """Directly train the edge scorer to recognize 1 -> 2 divisions.
 
@@ -134,7 +344,7 @@ def compute_division_consistency_loss(
 
         for i in torch.nonzero(division_rows, as_tuple=False).flatten():
             pos_mask = row_target[i] > 0
-            neg_mask = ~pos_mask
+            neg_mask = row_target[i] == 0
 
             pos_logits = row_logits[i][pos_mask]
             neg_logits = row_logits[i][neg_mask]
@@ -161,14 +371,21 @@ def compute_division_consistency_loss(
             # Every selected false edge should sit below the weaker
             # true daughter edge by at least ``margin``.
             weakest_positive = pos_logits.min()
+
             margin_loss = F.relu(
                 hard_neg - weakest_positive + margin
             ).mean()
 
-            losses.append(
-                positive_loss + margin_loss
+            negative_loss = F.binary_cross_entropy_with_logits(
+                hard_neg,
+                torch.zeros_like(hard_neg),
             )
 
+            losses.append(
+                positive_loss
+                + margin_loss
+                + negative_weight * negative_loss
+)
     if not losses:
         return logits.new_tensor(0.0, requires_grad=True)
 
@@ -187,7 +404,7 @@ def _evaluate_pair(
         return 0.0, 0, 0
 
     loss = compute_loss(logits, target, div_weight=div_weight).item()
-    probs = torch.softmax(logits, dim=0)
+    probs = torch.sigmoid(logits)
     preds = (probs > 0.5).float()
 
     mask = active_rows.unsqueeze(1) | active_cols.unsqueeze(0)
@@ -1315,12 +1532,8 @@ def train_epoch(
     t_data, t_forward, t_backward = 0.0, 0.0, 0.0
     t0 = time.perf_counter()
 
-    for _ in pbar:
-        batch = next(batch_iter)
-
-        if batch["t_start"][0].item() == 24:
-            print("  >>> HIT TARGET MITOSIS WINDOW t=24->25", flush=True)
-
+    for iter_idx in pbar:
+        batch = next(batch_iter)      
         imgs = batch["imgs"].to(
             device, dtype=torch.float32, non_blocking=True
         )
@@ -1405,21 +1618,6 @@ def train_epoch(
                 ns,
                 nt,
             )
-            if batch["t_start"][0].item() == 24:
-                division_rows = (pair_target.sum(dim=2) >= 2)
-
-                print(
-                    f"  >>> TARGET WINDOW pair_target shape={tuple(pair_target.shape)} "
-                    f"division_rows={int(division_rows.sum().item())}",
-                    flush=True,
-                )
-
-                if division_rows.any():
-                    idx = torch.nonzero(division_rows, as_tuple=False)
-                    print(
-                        f"  >>> division parent indices={idx.tolist()}",
-                        flush=True,
-                    )
 
             division_rows = (pair_target.sum(dim=2) >= 2).sum().item()
 
@@ -1441,6 +1639,16 @@ def train_epoch(
                 frame_det[i + 1][2],
             )
 
+            if iter_idx in {0, 25, 50, 75, 99}:
+                diagnose_edge_ranking(
+                    edge_logits,
+                    pair_target,
+                    frame_det[i][0] * ds_scale,
+                    frame_det[i + 1][0] * ds_scale,
+                    frame_det[i][2],
+                    frame_det[i + 1][2],
+                )
+
             block_losses.append(
                 compute_batch_loss(
                     edge_logits,
@@ -1460,21 +1668,13 @@ def train_epoch(
                     frame_det[i + 1][2],
                 )
             )
-
-            if division_rows > 0:
-                print(
-                    f"  [division loss] consistency="
-                    f"{division_consistency_losses[-1].item():.6f}",
-                    flush=True,
-                )
-
-                       # Parent-level division prediction
+             # Parent-level division prediction
             division_logits = model.predict_divisions(
                 frame_det[i][4],
                 frame_det[i + 1][4],
                 frame_det[i][0] * ds_scale,
                 frame_det[i + 1][0] * ds_scale,
-                frame_det[i][1],
+            frame_det[i][1],
                 frame_det[i + 1][1],
                 frame_det[i][2],
                 frame_det[i + 1][2],
