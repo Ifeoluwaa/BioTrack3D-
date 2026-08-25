@@ -1501,6 +1501,8 @@ def main() -> None:
                              "Default 0.3: the detector is poorly calibrated because the "
                              "ground truth is sparse (only some cells annotated), so a high "
                              "threshold keeps precision up. Sweep it for your model.")
+    parser.add_argument("--edge-threshold",type=float,default=0.5,
+                        help="Minimum sigmoid edge probability to keep as a candidate.")
     parser.add_argument("--use-ilp", action="store_true",
                         help="Post-process the predicted graph with the tracksdata ILP "
                              "solver (global, flow-consistent linking) instead of greedy "
@@ -1526,6 +1528,7 @@ def main() -> None:
     )
     cfg = PredictConfig(
         det_threshold=args.det_threshold,
+            threshold=args.edge_threshold,
         use_ilp=args.use_ilp,
         ilp_edge_weight=args.ilp_edge_weight,
         ilp_appearance_weight=args.ilp_appearance_weight,
