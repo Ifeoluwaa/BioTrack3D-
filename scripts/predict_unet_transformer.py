@@ -1028,8 +1028,103 @@ def predict_video(
                 p_mask_tgt,
             )
 
-            raw = edge_logits_pair[0]
+            # ----------------------------------------------------------
+            # Parent-level division prediction.
+            # This uses the trained division head with the exact same
+            # feature/coordinate conventions used during training.
+            # ----------------------------------------------------------
+            division_logits_pair = model.predict_divisions(
+                unet_feat_src,
+                unet_feat_tgt,
+                p_coords_src * ds_arr_t,
+                p_coords_tgt * ds_arr_t,
+                p_pos_src,
+                p_pos_tgt,
+                p_mask_src,
+                p_mask_tgt,
+            )
 
+            division_probs = (
+                torch.sigmoid(
+                    division_logits_pair[0]
+                )
+                .detach()
+                .cpu()
+                .numpy()
+            )
+
+            if t_src == 24 and t_tgt == 25:
+                order = np.argsort(
+                    division_probs
+                )[::-1]
+
+                print(
+                    "\n=== DIVISION HEAD DIAGNOSTIC t=24->25 ===",
+                    flush=True,
+                )
+
+                for rank, i in enumerate(
+                    order[:10],
+                    start=1,
+                ):
+                    coord = (
+                        p_coords_src[0, i] * ds_arr_t
+                    ).detach().cpu().numpy()
+
+                    global_id = int(idx_src[i])
+
+                    print(
+                        f"{rank}. "
+                        f"local={i} "
+                        f"global={global_id} "
+                        f"coord={coord.tolist()} "
+                        f"division_prob="
+                        f"{float(division_probs[i]):.6f}",
+                        flush=True,
+                    )
+
+            # Temporary division-head diagnostic.
+            # Trigger on the actual source frame coordinates, not the
+            # local window index.
+            # ----------------------------------------------------------
+            if (
+                p_coords_src.shape[1] > 0
+                and float(
+                    p_coords_src[0, :, 0].min().detach().cpu()
+                ) <= 45.0
+                <= float(
+                    p_coords_src[0, :, 0].max().detach().cpu()
+                )
+            ):
+                order = np.argsort(
+                    division_probs
+                )[::-1]
+
+                print(
+                    "\n=== DIVISION HEAD DIAGNOSTIC ===",
+                    flush=True,
+                )
+
+                for rank, i in enumerate(
+                    order[:10],
+                    start=1,
+                ):
+                    coord = (
+                        p_coords_src[0, i] * ds_arr_t
+                    ).detach().cpu().numpy()
+
+                    global_id = int(idx_src[i])
+
+                    print(
+                        f"{rank}. "
+                        f"local={i} "
+                        f"global={global_id} "
+                        f"coord={coord.tolist()} "
+                        f"division_prob="
+                        f"{float(division_probs[i]):.6f}",
+                        flush=True,
+                    )
+            raw = edge_logits_pair[0]
             if cfg.edge_activation == "softmax":
                 probs = (
                     torch.softmax(
@@ -1053,7 +1148,7 @@ def predict_video(
             MITOSIS_DAUGHTER_MIN_UM = 5.0
             MITOSIS_DAUGHTER_MAX_UM = 13.0
             MITOSIS_BONUS = 0.05
-            MITOSIS_MIN_EDGE_PROB = 0.45
+            MITOSIS_MIN_EDGE_PROB = cfg.threshold
 
             # p_coords_* are (1, n_nodes, 3).
             # These are original-resolution voxel coordinates.
@@ -1119,60 +1214,48 @@ def predict_video(
                         }
                     )
 
+            
             # ==========================================================
-            # Find plausible sibling pairs.
+            # Build joint division hypotheses.
+            #
+            # A division hypothesis is a parent + two daughters selected
+            # together. This is deliberately done BEFORE greedy edge
+            # selection so the two daughter edges can be reserved as a pair.
             # ==========================================================
-            by_parent: dict[
-                int,
-                list[dict],
-            ] = {}
+            division_pairs: list[dict] = []
+
+            by_parent: dict[int, list[dict]] = {}
 
             for cand in candidate_data:
-                if (
-                    cand["prob"]
-                    >= MITOSIS_MIN_EDGE_PROB
-                ):
+                if cand["prob"] >= MITOSIS_MIN_EDGE_PROB:
                     by_parent.setdefault(
                         cand["i"],
                         [],
                     ).append(cand)
 
-            for i, parent_candidates in (
-                by_parent.items()
-            ):
+            for parent_idx, parent_candidates in by_parent.items():
 
                 if len(parent_candidates) < 2:
                     continue
 
-                for a in range(
-                    len(parent_candidates)
-                ):
-                    for b in range(
-                        a + 1,
-                        len(parent_candidates),
-                    ):
+                for a in range(len(parent_candidates)):
+                    for b in range(a + 1, len(parent_candidates)):
 
                         ca = parent_candidates[a]
                         cb = parent_candidates[b]
 
-                        # --------------------------------------------------
-                        # Both parent -> daughter distances must be valid.
-                        # --------------------------------------------------
-                        if (
-                            ca["dist"]
-                            > MITOSIS_PARENT_MAX_UM
-                        ):
+                        # ------------------------------------------------------
+                        # Parent -> daughter distances.
+                        # ------------------------------------------------------
+                        if ca["dist"] > MITOSIS_PARENT_MAX_UM:
                             continue
 
-                        if (
-                            cb["dist"]
-                            > MITOSIS_PARENT_MAX_UM
-                        ):
+                        if cb["dist"] > MITOSIS_PARENT_MAX_UM:
                             continue
 
-                        # --------------------------------------------------
-                        # Daughter-to-daughter distance in physical units.
-                        # --------------------------------------------------
+                        # ------------------------------------------------------
+                        # Daughter-to-daughter distance.
+                        # ------------------------------------------------------
                         daughter_delta_voxel = (
                             tgt_xyz[ca["j"]]
                             - tgt_xyz[cb["j"]]
@@ -1199,17 +1282,63 @@ def predict_video(
                         ):
                             continue
 
-                        # --------------------------------------------------
-                        # Small ranking bonus only.
-                        # --------------------------------------------------
-                        ca["score"] += (
-                            MITOSIS_BONUS
+                        # ------------------------------------------------------
+                        # Symmetry of the two parent->daughter distances.
+                        # ------------------------------------------------------
+                        symmetry = (
+                            abs(ca["dist"] - cb["dist"])
+                            / max(
+                                ca["dist"] + cb["dist"],
+                                1e-6,
+                            )
                         )
 
-                        cb["score"] += (
-                            MITOSIS_BONUS
+                        if symmetry > 0.75:
+                            continue
+
+                        # ------------------------------------------------------
+                        # Joint pair score.
+                        #
+                        # This is intentionally pair-level rather than adding
+                        # independent bonuses to the two edges.
+                        # ------------------------------------------------------
+                        pair_edge_score = 0.5 * (
+                            ca["prob"] + cb["prob"]
                         )
 
+                        pair_geometry_score = (
+                            1.0 - min(symmetry, 1.0)
+                        )
+
+                        pair_score = (
+                            0.8 * pair_edge_score
+                            + 0.2 * pair_geometry_score
+                            + MITOSIS_BONUS
+                        )
+
+                        division_pairs.append(
+                            {
+                                "parent": parent_idx,
+                                "daughter1": ca["j"],
+                                "daughter2": cb["j"],
+                                "score": float(pair_score),
+                                "prob1": float(ca["prob"]),
+                                "prob2": float(cb["prob"]),
+                                "dist1": float(ca["dist"]),
+                                "dist2": float(cb["dist"]),
+                                "daughter_dist": float(
+                                    daughter_dist
+                                ),
+                                "symmetry": float(
+                                    symmetry
+                                ),
+                            }
+                        )
+
+            division_pairs.sort(
+                key=lambda x: x["score"],
+                reverse=True,
+            )
             # ==========================================================
             # Preserve original greedy association mechanism.
             # ==========================================================
@@ -1230,7 +1359,71 @@ def predict_video(
             children_count: dict[int, int] = {}
             parents_count: dict[int, int] = {}
 
+            # ==========================================================
+            # Joint division selection.
+            #
+            # Reserve both daughter edges together before ordinary greedy
+            # edges are considered.
+            # ==========================================================
+            selected_division_parents: set[int] = set()
 
+            for pair in division_pairs:
+
+                parent_idx = pair["parent"]
+                daughter1_idx = pair["daughter1"]
+                daughter2_idx = pair["daughter2"]
+
+                # Parent must not already have a child.
+                if children_count.get(parent_idx, 0) != 0:
+                    continue
+
+                # Neither daughter can already have a parent.
+                if parents_count.get(daughter1_idx, 0) != 0:
+                    continue
+
+                if parents_count.get(daughter2_idx, 0) != 0:
+                    continue
+
+                gi = int(
+                    idx_src[parent_idx]
+                )
+
+                gj1 = int(
+                    idx_tgt[daughter1_idx]
+                )
+
+                gj2 = int(
+                    idx_tgt[daughter2_idx]
+                )
+
+                # Add BOTH edges as one division hypothesis.
+                all_edges.append(
+                    (
+                        gi,
+                        gj1,
+                        float(pair["prob1"]),
+                        float(pair["dist1"]),
+                    )
+                )
+
+                all_edges.append(
+                    (
+                        gi,
+                        gj2,
+                        float(pair["prob2"]),
+                        float(pair["dist2"]),
+                    )
+                )
+
+                children_count[parent_idx] = 2
+                parents_count[daughter1_idx] = 1
+                parents_count[daughter2_idx] = 1
+
+                selected_division_parents.add(
+                    parent_idx
+                )
+
+            
             # ----------------------------------------------------------
             # Greedy edge selection.
             # ----------------------------------------------------------
@@ -1241,6 +1434,9 @@ def predict_video(
                 j,
                 dist,
             ) in candidates:
+
+                if i in selected_division_parents:
+                    continue
 
                 n_ch = children_count.get(
                     i,

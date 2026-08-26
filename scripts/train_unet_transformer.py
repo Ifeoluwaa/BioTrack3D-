@@ -1668,35 +1668,9 @@ def train_epoch(
                     frame_det[i + 1][2],
                 )
             )
-             # Parent-level division prediction
-            division_logits = model.predict_divisions(
-                frame_det[i][4],
-                frame_det[i + 1][4],
-                frame_det[i][0] * ds_scale,
-                frame_det[i + 1][0] * ds_scale,
-            frame_det[i][1],
-                frame_det[i + 1][1],
-                frame_det[i][2],
-                frame_det[i + 1][2],
-            )
-
-            # Parent is positive if it has >1 GT children.
-            division_target = build_division_targets(
-                pair_target,
-                division_logits.shape[1],
-            )
-
-
-            division_losses.append(
-                compute_division_loss(
-                    division_logits,
-                    division_target,
-                    frame_det[i][2],
-                )
-            )
 
         edge_loss = sum(block_losses) / len(block_losses)
-        division_loss = sum(division_losses) / len(division_losses)
+        division_loss = edge_loss.new_tensor(0.0)
 
         division_consistency_loss = (
             sum(division_consistency_losses)
@@ -1706,7 +1680,6 @@ def train_epoch(
         loss = (
             edge_loss
             + det_loss_weight * det_loss
-            + div_weight * division_loss
             + div_consistency_weight * division_consistency_loss
         )
 
