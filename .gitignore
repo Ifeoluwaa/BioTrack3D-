@@ -21,3 +21,28 @@ videos/
 
 # Local config
 .env
+# Virtual environments
+.venv/
+.venv-arm64/
+
+# Outputs
+predictions/
+tmp/
+tmp_*/
+analysis/
+
+# Logs
+*.log
+audit_*.csv
+mitosis_audit.*
+frame*_debug.log
+p*_debug.log
+
+# Model artifacts
+weights/
+*.pth
+*.pt
+*.ckpt
+
+# macOS
+.DS_Store
