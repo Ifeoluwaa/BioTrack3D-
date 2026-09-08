@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""BioTrack3D++ V16 precision-first division rescue.
+"""BioTrack3D++ V16.1 precision-first division rescue.
 
 This version keeps the V15 detector, edge predictor, greedy 1->1 association,
 and optional ILP settings intact. Division completion is performed only AFTER
@@ -663,6 +663,11 @@ def add_precision_divisions_post_ilp(
         for global_index, node_id in enumerate(global_to_node_id)
     }
 
+    # ILP/decoder may remove detections entirely from the returned graph.
+    # A missing node is NOT the same thing as an unclaimed/free node.
+    # Only post-ILP survivors can be used as endpoints of a rescue edge.
+    surviving_node_ids = {int(node_id) for node_id in graph.node_ids()}
+
     outgoing: dict[int, list[tuple[int, float, float]]] = {}
     incoming_sources: dict[int, list[int]] = {}
     edge_set: set[tuple[int, int]] = set()
@@ -693,6 +698,7 @@ def add_precision_divisions_post_ilp(
 
     accepted_proposals: list[dict] = []
     eligible_count = 0
+    removed_by_ilp_count = 0
 
     for parent, children in outgoing.items():
         # Rescue only a missing second child; never rewrite existing topology.
@@ -723,6 +729,15 @@ def add_precision_divisions_post_ilp(
             if raw_edge_prob < config.division_min_edge_prob:
                 continue
             if int(coords_ds[candidate, 0]) != parent_time + 1:
+                continue
+
+            candidate_node_id = global_to_node_id[int(candidate)]
+
+            # The ILP solver can remove detections from the returned graph.
+            # Do not confuse a removed detection with a surviving but unclaimed
+            # daughter. bulk_add_edges() can only target nodes that still exist.
+            if candidate_node_id not in surviving_node_ids:
+                removed_by_ilp_count += 1
                 continue
 
             # A rescued daughter must genuinely be free after ILP. This avoids
@@ -933,6 +948,16 @@ def add_precision_divisions_post_ilp(
         used_children.add(candidate)
 
     if selected:
+        # Final endpoint validation against the solved graph. This should be
+        # redundant with the candidate gate above, but keeps rescue failure-safe.
+        selected = [
+            row
+            for row in selected
+            if global_to_node_id[int(row["parent"])] in surviving_node_ids
+            and global_to_node_id[int(row["candidate_child"])] in surviving_node_ids
+        ]
+
+    if selected:
         graph.bulk_add_edges(
             [
                 {
@@ -957,9 +982,10 @@ def add_precision_divisions_post_ilp(
                 row["decision"] = "accepted"
 
     print(
-        f"[V16 RESCUE] video={video_name} "
+        f"[V16.1 RESCUE] video={video_name} "
         f"eligible={eligible_count} "
         f"passed={len(accepted_proposals)} "
+        f"removed_by_ilp={removed_by_ilp_count} "
         f"cap={division_cap} "
         f"added={len(selected)}",
         flush=True,
@@ -967,7 +993,7 @@ def add_precision_divisions_post_ilp(
 
     for row in selected:
         print(
-            f"[V16 ACCEPT] parent={row['parent']} "
+            f"[V16.1 ACCEPT] parent={row['parent']} "
             f"existing={row['existing_child']} "
             f"rescued={row['candidate_child']} "
             f"pair={row['pair_score']:.3f} "
@@ -1684,7 +1710,7 @@ def predict(
         )
 
         print(
-            f"[POST-V16 RESCUE] {name}: "
+            f"[POST-V16.1 RESCUE] {name}: "
             f"added={added_divisions} "
             f"edges={graph.num_edges()} "
             f"divisions={count_divisions_in_graph(graph)}",
@@ -1755,7 +1781,7 @@ def predict(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Run BioTrack3D++ V16 with post-ILP precision-first "
+            "Run BioTrack3D++ V16.1 with post-ILP precision-first "
             "division rescue."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -2009,7 +2035,7 @@ def main() -> None:
 
     for fold in folds:
         print(
-            "BioTrack3D++ V16: "
+            "BioTrack3D++ V16.1: "
             "strong V15 tracker + precision-first post-ILP division rescue",
             flush=True,
         )
