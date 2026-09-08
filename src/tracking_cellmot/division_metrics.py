@@ -335,20 +335,81 @@ def score_divisions(
     pred_div_nodes = set(pred_graph.dividing_nodes())
 
     candidates: dict[int, set[int]] = {}
+    candidates: dict[int, set[int]] = {}
+
     for div_node, matched_pred in matched.items():
+
         matched_attrs = _matched_node_attrs(matched_pred)
-        node_ids = matched_attrs[td.DEFAULT_ATTR_KEYS.NODE_ID].to_list()
-        components = _weakly_connected_components(matched_pred, node_ids)
+
+        # Is predicted node 668 part of this GT division?
+        has668 = (
+            matched_attrs.filter(
+                pl.col(td.DEFAULT_ATTR_KEYS.NODE_ID) == 668
+            ).height > 0
+        )
+        if has668:
+            print("graph.node_ids()[:10] =", matched_pred.node_ids()[:10], flush=True)
+            print("NODE_ID attrs =", matched_attrs[td.DEFAULT_ATTR_KEYS.NODE_ID].to_list(), flush=True)
+
+        if has668:
+            print("\n=== PRED NODE 668 MATCH ===", flush=True)
+            print(f"GT divider={div_node}", flush=True)
+            print(matched_attrs, flush=True)
+            for n in [639, 668, 702, 703, 736, 738]:
+                print(
+                    f"{n}: pred={matched_pred.predecessors(n)} "
+                    f"succ={matched_pred.successors(n)}",
+                    flush=True,
+                )
+
+        node_ids = matched_attrs[
+            td.DEFAULT_ATTR_KEYS.NODE_ID
+        ].to_list()
+
+        components = _weakly_connected_components(
+            matched_pred,
+            node_ids,
+        )
+
         gt_div = gt_divisions[div_node]
         div_candidates: set[int] = set()
-        for matched_subset, visited in components:
-            comp_attrs = matched_attrs.filter(
-                pl.col(td.DEFAULT_ATTR_KEYS.NODE_ID).is_in(list(matched_subset))
-            )
-            if _has_stage_coverage(comp_attrs, gt_div, div_node):
-                div_candidates |= visited & pred_div_nodes
-        candidates[div_node] = div_candidates
 
+        for matched_subset, visited in components:
+
+            comp_attrs = matched_attrs.filter(
+                pl.col(td.DEFAULT_ATTR_KEYS.NODE_ID).is_in(
+                    list(matched_subset)
+                )
+            )
+
+            covered = _has_stage_coverage(
+                comp_attrs,
+                gt_div,
+                div_node,
+            )
+
+            if has668:
+                print(
+                    f"matched_subset={sorted(matched_subset)}",
+                    flush=True,
+                )
+                print(
+                    f"visited={sorted(list(visited))[:30]}",
+                    flush=True,
+                )
+                print(
+                    f"pred_dividers={sorted(list(visited & pred_div_nodes))}",
+                    flush=True,
+                )
+                print(
+                    f"covered={covered}",
+                    flush=True,
+                )
+
+            if covered:
+                div_candidates |= visited & pred_div_nodes
+
+        candidates[div_node] = div_candidates
     pairing = _bipartite_max_matching(list(candidates), candidates)
     return {div: int(div in pairing) for div in candidates}
 
