@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""BioTrack3D++ V16.1 precision-first division rescue.
+"""BioTrack3D++ V16.2 precision-first division rescue.
 
 This version keeps the V15 detector, edge predictor, greedy 1->1 association,
 and optional ILP settings intact. Division completion is performed only AFTER
@@ -648,11 +648,23 @@ def add_precision_divisions_post_ilp(
     audit_rows: list[dict],
     video_name: str,
 ) -> int:
-    """Add only selective second daughters after ILP/graph decoding.
+    """Add precision-first second daughters after ILP/graph decoding.
 
-    The rescue cap is an emergency ceiling. Proposals must independently pass
-    biology, neural evidence, persistence, target-availability and ambiguity
-    checks before they are even eligible for the cap.
+    V16.2 deliberately does *not* globally rank unrelated parents.  The learned
+    mitosis score is used only to choose the best daughter completion for each
+    parent.  Each parent then independently ACCEPTS or ABSTAINS.
+
+    Current high-precision experiment: accept only a strongly anchored lineage:
+      * verified mitosis biology passes;
+      * existing 1->1 edge is very strong;
+      * second-daughter raw neural edge is present;
+      * both daughter branches persist for >=3 links;
+      * parent has >=3-link history;
+      * branches remain separate;
+      * if multiple candidates survive, the best pair has a real margin.
+
+    The global division cap remains an emergency ceiling only. It must never be
+    used to choose the 'top K' biological proposals.
     """
     if len(coords_ds) == 0 or graph.num_edges() == 0:
         return 0
@@ -663,9 +675,6 @@ def add_precision_divisions_post_ilp(
         for global_index, node_id in enumerate(global_to_node_id)
     }
 
-    # ILP/decoder may remove detections entirely from the returned graph.
-    # A missing node is NOT the same thing as an unclaimed/free node.
-    # Only post-ILP survivors can be used as endpoints of a rescue edge.
     surviving_node_ids = {int(node_id) for node_id in graph.node_ids()}
 
     outgoing: dict[int, list[tuple[int, float, float]]] = {}
@@ -690,18 +699,23 @@ def add_precision_divisions_post_ilp(
     for (parent, child), prob in candidate_edges_by_pair.items():
         raw_by_parent.setdefault(int(parent), []).append((int(child), float(prob)))
 
-    max_time = int(np.max(coords_ds[:, 0])) if len(coords_ds) else -1
     division_cap = max(
         1,
         int(round(graph.num_edges() * config.max_division_fraction)),
     )
 
-    accepted_proposals: list[dict] = []
+    # V16.2 strong-anchor thresholds. These are contextual rescue thresholds,
+    # NOT replacements for the learned mitosis biology.
+    strong_existing_edge_min = 0.80
+    strong_branch_persistence_min = 3
+    strong_parent_history_min = 3
+
+    independently_accepted: list[dict] = []
     eligible_count = 0
     removed_by_ilp_count = 0
 
     for parent, children in outgoing.items():
-        # Rescue only a missing second child; never rewrite existing topology.
+        # Complete only a 1->1 family. Never rewrite topology here.
         if len(children) != 1:
             continue
         if len(incoming_sources.get(parent, [])) == 0:
@@ -720,7 +734,6 @@ def add_precision_divisions_post_ilp(
 
         parent_xyz = coords_ds[parent, 1:].astype(np.float32)
         existing_xyz = coords_ds[existing, 1:].astype(np.float32)
-
         family_candidates: list[dict] = []
 
         for candidate, raw_edge_prob in raw_by_parent.get(parent, []):
@@ -732,35 +745,20 @@ def add_precision_divisions_post_ilp(
                 continue
 
             candidate_node_id = global_to_node_id[int(candidate)]
-
-            # The ILP solver can remove detections from the returned graph.
-            # Do not confuse a removed detection with a surviving but unclaimed
-            # daughter. bulk_add_edges() can only target nodes that still exist.
             if candidate_node_id not in surviving_node_ids:
                 removed_by_ilp_count += 1
                 continue
 
-            # A rescued daughter must genuinely be free after ILP. This avoids
-            # creating a second parent for a cell already claimed by another track.
+            # Candidate must survive ILP and be genuinely parent-free.
             if len(incoming_sources.get(candidate, [])) != 0:
                 continue
 
             candidate_xyz = coords_ds[candidate, 1:].astype(np.float32)
-            candidate_dist = physical_distance(
-                parent_xyz,
-                candidate_xyz,
-                voxel_size_ds,
-            )
+            candidate_dist = physical_distance(parent_xyz, candidate_xyz, voxel_size_ds)
             if candidate_dist > config.division_parent_max_um:
                 continue
 
-            # Existing child is already capped at 10.4 um above, so both parent
-            # distances satisfy the verified <=11 um biological gate here.
-            sister_dist = physical_distance(
-                existing_xyz,
-                candidate_xyz,
-                voxel_size_ds,
-            )
+            sister_dist = physical_distance(existing_xyz, candidate_xyz, voxel_size_ds)
             if not (
                 config.division_sister_min_um
                 <= sister_dist
@@ -769,11 +767,7 @@ def add_precision_divisions_post_ilp(
                 continue
 
             midpoint_xyz = 0.5 * (existing_xyz + candidate_xyz)
-            midpoint_error = physical_distance(
-                parent_xyz,
-                midpoint_xyz,
-                voxel_size_ds,
-            )
+            midpoint_error = physical_distance(parent_xyz, midpoint_xyz, voxel_size_ds)
             if midpoint_error > config.division_midpoint_max_um:
                 continue
 
@@ -781,6 +775,7 @@ def add_precision_divisions_post_ilp(
             d2 = float(candidate_dist)
             if max(d1, d2) <= 1e-8:
                 continue
+
             pds = min(d1, d2) / max(d1, d2)
             angle = division_angle_deg(
                 parent_xyz,
@@ -800,8 +795,6 @@ def add_precision_divisions_post_ilp(
             parent_history = _linear_backward_length(parent, incoming_sources)
 
             both_persist = existing_forward >= 1 and candidate_forward >= 1
-            one_persists = existing_forward >= 1 or candidate_forward >= 1
-
             branches_separate = True
             if both_persist:
                 existing_next = int(outgoing[existing][0][0])
@@ -815,7 +808,7 @@ def add_precision_divisions_post_ilp(
                     "candidate_child": candidate,
                     "head_prob": head_prob,
                     "existing_edge_prob": float(existing_prob),
-                    "candidate_edge_prob": raw_edge_prob,
+                    "candidate_edge_prob": float(raw_edge_prob),
                     "existing_dist_um": d1,
                     "candidate_dist_um": d2,
                     "sister_dist_um": sister_dist,
@@ -827,7 +820,6 @@ def add_precision_divisions_post_ilp(
                     "candidate_forward_len": candidate_forward,
                     "parent_history_len": parent_history,
                     "both_persist": both_persist,
-                    "one_persists": one_persists,
                     "branches_separate": branches_separate,
                 }
             )
@@ -835,63 +827,52 @@ def add_precision_divisions_post_ilp(
         if not family_candidates:
             continue
 
-        # The best candidate must beat the next biologically plausible candidate.
-        # This is a confidence/ambiguity test, not a top-K quota.
+        # IMPORTANT: pair score compares candidate daughters only *within this
+        # parent*. It is never used to globally rank different parents.
         family_candidates.sort(
             key=lambda row: (
                 row["pair_score"],
-                min(row["existing_edge_prob"], row["candidate_edge_prob"]),
+                row["candidate_edge_prob"],
             ),
             reverse=True,
         )
         best = family_candidates[0]
+        n_competing = len(family_candidates)
         second_score = (
             float(family_candidates[1]["pair_score"])
-            if len(family_candidates) > 1
-            else 0.0
+            if n_competing > 1
+            else None
         )
-        pair_margin = float(best["pair_score"] - second_score)
-        n_competing = len(family_candidates)
+        pair_margin = (
+            float(best["pair_score"] - second_score)
+            if second_score is not None
+            else float("nan")
+        )
         eligible_count += n_competing
 
-        decision = "accepted_candidate"
-        required_margin = config.division_pair_margin if n_competing > 1 else 0.0
-
+        # Start with verified biology/lineage requirements.
+        decision = "reject_not_strong_anchor"
         if best["pair_score"] < config.division_min_score:
             decision = "reject_low_pair_score"
         elif not best["branches_separate"]:
             decision = "reject_branch_merge"
-        elif not best["one_persists"]:
-            decision = "reject_no_daughter_persistence"
-        elif best["both_persist"]:
-            if pair_margin < required_margin:
-                decision = "reject_ambiguous_pair"
+        elif not best["both_persist"]:
+            decision = "reject_not_both_persistent"
+        elif n_competing > 1 and pair_margin < config.division_pair_margin:
+            decision = "reject_ambiguous_pair"
         else:
-            # Single-persistence fallback is intentionally much stricter.
-            single_margin = max(config.division_pair_margin, 0.05)
-            if best["pair_score"] < config.division_single_persist_min_score:
-                decision = "reject_single_persist_pair_score"
-            elif best["candidate_edge_prob"] < config.division_single_persist_min_edge_prob:
-                decision = "reject_single_persist_edge"
-            elif best["head_prob"] < config.division_single_persist_min_head_prob:
-                decision = "reject_single_persist_head"
-            elif n_competing > 1 and pair_margin < single_margin:
-                decision = "reject_single_persist_ambiguous"
+            strong_anchor = (
+                best["existing_edge_prob"] >= strong_existing_edge_min
+                and best["candidate_edge_prob"] >= config.division_min_edge_prob
+                and best["existing_forward_len"] >= strong_branch_persistence_min
+                and best["candidate_forward_len"] >= strong_branch_persistence_min
+                and best["parent_history_len"] >= strong_parent_history_min
+            )
+            if strong_anchor:
+                decision = "accepted_strong_anchor"
 
-        # Use context only to rank proposals that already passed every gate.
-        # It does not force any proposal to be accepted.
-        min_edge = min(best["existing_edge_prob"], best["candidate_edge_prob"])
-        persistence_strength = min(
-            best["existing_forward_len"],
-            best["candidate_forward_len"],
-            2,
-        ) / 2.0
-        priority = (
-            best["pair_score"]
-            + 0.10 * min_edge
-            + 0.08 * best["head_prob"]
-            + 0.05 * persistence_strength
-            + 0.03 * min(max(pair_margin, 0.0), 0.20) / 0.20
+        edge_ratio = (
+            best["candidate_edge_prob"] / max(best["existing_edge_prob"], 1e-8)
         )
 
         audit_rows.append(
@@ -917,44 +898,45 @@ def add_precision_divisions_post_ilp(
                 "existing_forward_len": best["existing_forward_len"],
                 "candidate_forward_len": best["candidate_forward_len"],
                 "parent_history_len": best["parent_history_len"],
-                "priority": priority,
+                # Keep this column for CSV compatibility, but it is no longer a
+                # global ranking score. Store the edge ratio for diagnostics.
+                "priority": edge_ratio,
                 "decision": decision,
             }
         )
 
-        if decision == "accepted_candidate":
+        if decision == "accepted_strong_anchor":
             best["pair_margin"] = pair_margin
             best["num_competing_candidates"] = n_competing
-            best["priority"] = priority
-            accepted_proposals.append(best)
+            best["edge_ratio"] = edge_ratio
+            independently_accepted.append(best)
 
-    accepted_proposals.sort(key=lambda row: row["priority"], reverse=True)
+    # No global sort/top-K. Resolve only direct endpoint conflicts. In the rare
+    # case two independently accepted parents want the same daughter, abstain on
+    # that conflicted daughter instead of ranking unrelated parents.
+    child_claims: dict[int, list[dict]] = {}
+    for proposal in independently_accepted:
+        child_claims.setdefault(int(proposal["candidate_child"]), []).append(proposal)
 
-    selected: list[dict] = []
-    used_parents: set[int] = set()
-    used_children: set[int] = set()
+    selected = [
+        proposal
+        for proposal in independently_accepted
+        if len(child_claims[int(proposal["candidate_child"])]) == 1
+    ]
 
-    for proposal in accepted_proposals:
-        if len(selected) >= division_cap:
-            break
-        parent = int(proposal["parent"])
-        candidate = int(proposal["candidate_child"])
-        if parent in used_parents or candidate in used_children:
-            continue
-        if len(incoming_sources.get(candidate, [])) != 0:
-            continue
-        selected.append(proposal)
-        used_parents.add(parent)
-        used_children.add(candidate)
+    # Emergency ceiling only. If this ever triggers, fail conservative: keep no
+    # arbitrary top-K ranking. The audit/log will tell us to inspect the rule.
+    cap_triggered = len(selected) > division_cap
+    if cap_triggered:
+        selected = []
 
     if selected:
-        # Final endpoint validation against the solved graph. This should be
-        # redundant with the candidate gate above, but keeps rescue failure-safe.
         selected = [
             row
             for row in selected
             if global_to_node_id[int(row["parent"])] in surviving_node_ids
             and global_to_node_id[int(row["candidate_child"])] in surviving_node_ids
+            and len(incoming_sources.get(int(row["candidate_child"]), [])) == 0
         ]
 
     if selected:
@@ -963,8 +945,6 @@ def add_precision_divisions_post_ilp(
                 {
                     "source_id": global_to_node_id[int(row["parent"])],
                     "target_id": global_to_node_id[int(row["candidate_child"])],
-                    # Keep the actual neural edge probability; do not inflate it
-                    # to 0.95 after decoding.
                     "edge_prob": float(row["candidate_edge_prob"]),
                     "edge_dist": float(row["candidate_dist_um"]),
                 }
@@ -978,29 +958,38 @@ def add_precision_divisions_post_ilp(
         }
         for row in audit_rows:
             key = (int(row.get("parent", -1)), int(row.get("candidate_child", -1)))
-            if key in selected_keys and row.get("decision") == "accepted_candidate":
+            if key in selected_keys and row.get("decision") == "accepted_strong_anchor":
                 row["decision"] = "accepted"
 
     print(
-        f"[V16.1 RESCUE] video={video_name} "
+        f"[V16.2 RESCUE] video={video_name} "
         f"eligible={eligible_count} "
-        f"passed={len(accepted_proposals)} "
+        f"independent_pass={len(independently_accepted)} "
         f"removed_by_ilp={removed_by_ilp_count} "
         f"cap={division_cap} "
+        f"cap_triggered={cap_triggered} "
         f"added={len(selected)}",
         flush=True,
     )
 
     for row in selected:
+        margin_text = (
+            f"{row['pair_margin']:.3f}"
+            if np.isfinite(row["pair_margin"])
+            else "NA"
+        )
         print(
-            f"[V16.1 ACCEPT] parent={row['parent']} "
+            f"[V16.2 ACCEPT] parent={row['parent']} "
             f"existing={row['existing_child']} "
             f"rescued={row['candidate_child']} "
             f"pair={row['pair_score']:.3f} "
-            f"margin={row['pair_margin']:.3f} "
-            f"edge={row['candidate_edge_prob']:.3f} "
+            f"margin={margin_text} "
+            f"existing_edge={row['existing_edge_prob']:.3f} "
+            f"candidate_edge={row['candidate_edge_prob']:.3f} "
+            f"edge_ratio={row['edge_ratio']:.3f} "
             f"head={row['head_prob']:.3f} "
-            f"persist={row['existing_forward_len']}/{row['candidate_forward_len']}",
+            f"persist={row['existing_forward_len']}/{row['candidate_forward_len']} "
+            f"history={row['parent_history_len']}",
             flush=True,
         )
 
@@ -1710,7 +1699,7 @@ def predict(
         )
 
         print(
-            f"[POST-V16.1 RESCUE] {name}: "
+            f"[POST-V16.2 RESCUE] {name}: "
             f"added={added_divisions} "
             f"edges={graph.num_edges()} "
             f"divisions={count_divisions_in_graph(graph)}",
@@ -1781,7 +1770,7 @@ def predict(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Run BioTrack3D++ V16.1 with post-ILP precision-first "
+            "Run BioTrack3D++ V16.2 with post-ILP precision-first "
             "division rescue."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -2035,7 +2024,7 @@ def main() -> None:
 
     for fold in folds:
         print(
-            "BioTrack3D++ V16.1: "
+            "BioTrack3D++ V16.2: "
             "strong V15 tracker + precision-first post-ILP division rescue",
             flush=True,
         )
