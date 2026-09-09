@@ -1,15 +1,17 @@
 #!/usr/bin/env python
-"""BioTrack3D++ V16.2 precision-first division rescue.
+"""BioTrack3D++ V16.3 edge-global + evidence-calibrated mitosis.
 
-This version keeps the V15 detector, edge predictor, greedy 1->1 association,
-and optional ILP settings intact. Division completion is performed only AFTER
-ILP/graph decoding and is deliberately abstaining:
+V16.3 targets the two error sources identified by GT diagnostics:
 
-1. Require raw neural parent->candidate edge evidence.
-2. Apply the verified BioHub hard geometry gates.
-3. Score the daughter pair with the learned 4-feature logistic mitosis model.
-4. Require post-ILP daughter persistence and reject ambiguous families.
-5. Use max_division_fraction only as an emergency ceiling, never as a quota.
+1. Ordinary edges: most FNs are association misses, so replace framewise greedy
+   matching with optional global maximum-gain bipartite matching over the SAME
+   neural candidate set, threshold, and distance gate.
+2. Mitosis: preserve the verified atlas geometry/logistic score, but calibrate the
+   final rescue decision with raw daughter-edge evidence from labeled proposals.
+3. Keep post-ILP family completion and use the division cap only as an emergency
+   ceiling, never as a quota.
+
+No GT information is used during inference.
 
 Usage
 -----
@@ -40,6 +42,7 @@ import torch
 import torch.nn.functional as F
 import zarr
 from tqdm import tqdm
+from scipy.optimize import linear_sum_assignment
 
 
 # Compatibility shim for some tracksdata / Polars combinations.
@@ -79,13 +82,17 @@ from tracking_cellmot.metrics import summarise
 class PredictConfig:
     """Prediction, graph-decoding, and precision-first division settings."""
 
-    # Keep the strong V15 tracker unchanged.
+    # Keep detector and neural edge model unchanged.
     det_threshold: float = 0.30
     det_tta: bool = True
     pool_kernel_um: float = 5.0
 
     edge_threshold: float = 0.20
     max_link_distance_um: float = 15.0
+
+    # V16.3: global framewise assignment is the default because GT diagnostics
+    # showed 318/369 edge FNs were association misses. Use "greedy" for A/B.
+    association_mode: str = "global"
 
     # Neural evidence.
     division_head_threshold: float = 0.58
@@ -98,9 +105,17 @@ class PredictConfig:
     division_midpoint_max_um: float = 6.0
     division_existing_child_max_um: float = 10.4
 
-    # Learned biology score. The known true 668 -> {702,703} pair is ~0.215,
-    # so this intentionally stays at 0.20 rather than being raised blindly.
-    division_min_score: float = 0.20
+    # Learned biology remains a family plausibility/ranking signal. Labeled GT
+    # proposals in the first-8 diagnostic include a true pair at ~0.07465, so
+    # the V16.3 evidence route uses a conservative floor of 0.07.
+    division_min_score: float = 0.07
+
+    # Labeled rescue calibration (5 exact GT pairs vs 3 harmful rescue FPs):
+    # all exact pairs had candidate edge >= 0.3279; all harmful FPs <= 0.2932.
+    # These thresholds complement, not replace, the atlas geometry/biology.
+    division_evidence_head_min: float = 0.83
+    division_evidence_existing_edge_min: float = 0.65
+    division_evidence_candidate_edge_min: float = 0.32
 
     # Precision / ambiguity controls. The verified true pair beats its known
     # confusing alternative by ~0.041, so 0.03 preserves that example.
@@ -549,8 +564,83 @@ def build_normal_associations(
     return selected
 
 
+def build_global_associations(
+    probabilities: np.ndarray,
+    source_coords_ds: np.ndarray,
+    target_coords_ds: np.ndarray,
+    source_global_indices: np.ndarray,
+    target_global_indices: np.ndarray,
+    voxel_size_ds: np.ndarray,
+    edge_threshold: float,
+    max_link_distance_um: float,
+) -> list[tuple[int, int, float, float]]:
+    """Globally optimize 1->1 links for one frame pair.
+
+    Uses the exact same candidate threshold and physical distance gate as the
+    historical greedy matcher. Each eligible edge receives a positive gain
+    logit(p)-logit(threshold); leaving a source/target unmatched has zero gain.
+    A square assignment with dummy rows/columns therefore chooses the globally
+    best compatible set without forcing low-confidence links.
+    """
+    n_source, n_target = probabilities.shape
+    if n_source == 0 or n_target == 0:
+        return []
+
+    eps = 1e-6
+    threshold = float(np.clip(edge_threshold, eps, 1.0 - eps))
+    threshold_logit = float(np.log(threshold / (1.0 - threshold)))
+
+    size = n_source + n_target
+    # Zero-cost dummy assignments represent appearing/disappearing tracks.
+    cost = np.zeros((size, size), dtype=np.float64)
+    valid = np.zeros((n_source, n_target), dtype=bool)
+    distances = np.full((n_source, n_target), np.inf, dtype=np.float32)
+
+    # Invalid real-real links must be much worse than a dummy assignment.
+    cost[:n_source, :n_target] = 1e6
+
+    for source_local in range(n_source):
+        for target_local in range(n_target):
+            probability = float(probabilities[source_local, target_local])
+            if probability < edge_threshold:
+                continue
+            distance_um = physical_distance(
+                source_coords_ds[source_local],
+                target_coords_ds[target_local],
+                voxel_size_ds,
+            )
+            if distance_um > max_link_distance_um:
+                continue
+
+            p = float(np.clip(probability, eps, 1.0 - eps))
+            gain = float(np.log(p / (1.0 - p)) - threshold_logit)
+            if gain <= 0.0:
+                continue
+
+            valid[source_local, target_local] = True
+            distances[source_local, target_local] = float(distance_um)
+            cost[source_local, target_local] = -gain
+
+    row_ind, col_ind = linear_sum_assignment(cost)
+    selected: list[tuple[int, int, float, float]] = []
+    for row, col in zip(row_ind, col_ind, strict=True):
+        if row >= n_source or col >= n_target:
+            continue
+        if not valid[row, col]:
+            continue
+        selected.append(
+            (
+                int(source_global_indices[row]),
+                int(target_global_indices[col]),
+                float(probabilities[row, col]),
+                float(distances[row, col]),
+            )
+        )
+    return selected
+
+
 # =============================================================================
-# V16 precision-first post-ILP division rescue
+# V16.3 evidence-calibrated post-ILP division rescue
 # =============================================================================
 
 def division_angle_deg(
@@ -648,23 +738,15 @@ def add_precision_divisions_post_ilp(
     audit_rows: list[dict],
     video_name: str,
 ) -> int:
-    """Add precision-first second daughters after ILP/graph decoding.
+    """Add evidence-calibrated mitoses after ordinary graph decoding.
 
-    V16.2 deliberately does *not* globally rank unrelated parents.  The learned
-    mitosis score is used only to choose the best daughter completion for each
-    parent.  Each parent then independently ACCEPTS or ABSTAINS.
-
-    Current high-precision experiment: accept only a strongly anchored lineage:
-      * verified mitosis biology passes;
-      * existing 1->1 edge is very strong;
-      * second-daughter raw neural edge is present;
-      * both daughter branches persist for >=3 links;
-      * parent has >=3-link history;
-      * branches remain separate;
-      * if multiple candidates survive, the best pair has a real margin.
-
-    The global division cap remains an emergency ceiling only. It must never be
-    used to choose the 'top K' biological proposals.
+    V16.3 keeps the verified hard geometry and 4-feature atlas score, but the
+    final accept/abstain step is driven by raw neural daughter-edge evidence.
+    This follows the labeled first-8 audit: all five exact GT proposals had a
+    second-daughter edge >=0.3279, while all three metric-harmful rescue FPs
+    were <=0.2932. Persistence/history are retained for audit/context but are
+    not mandatory because real early/short daughter branches can have 0-1
+    forward links. No proposals are globally ranked across unrelated parents.
     """
     if len(coords_ds) == 0 or graph.num_edges() == 0:
         return 0
@@ -703,12 +785,6 @@ def add_precision_divisions_post_ilp(
         1,
         int(round(graph.num_edges() * config.max_division_fraction)),
     )
-
-    # V16.2 strong-anchor thresholds. These are contextual rescue thresholds,
-    # NOT replacements for the learned mitosis biology.
-    strong_existing_edge_min = 0.80
-    strong_branch_persistence_min = 3
-    strong_parent_history_min = 3
 
     independently_accepted: list[dict] = []
     eligible_count = 0
@@ -827,50 +903,70 @@ def add_precision_divisions_post_ilp(
         if not family_candidates:
             continue
 
-        # IMPORTANT: pair score compares candidate daughters only *within this
-        # parent*. It is never used to globally rank different parents.
-        family_candidates.sort(
-            key=lambda row: (
-                row["pair_score"],
-                row["candidate_edge_prob"],
-            ),
-            reverse=True,
+        # V16.3 selection: first require the labeled neural-evidence envelope,
+        # then use the learned biology to choose among surviving daughters for
+        # THIS parent. This prevents a geometry-high / neural-weak distractor
+        # from blocking a true daughter before the evidence gate is applied.
+        raw_best = max(
+            family_candidates,
+            key=lambda row: (row["pair_score"], row["candidate_edge_prob"]),
         )
-        best = family_candidates[0]
-        n_competing = len(family_candidates)
-        second_score = (
-            float(family_candidates[1]["pair_score"])
-            if n_competing > 1
-            else None
-        )
-        pair_margin = (
-            float(best["pair_score"] - second_score)
-            if second_score is not None
-            else float("nan")
-        )
-        eligible_count += n_competing
 
-        # Start with verified biology/lineage requirements.
-        decision = "reject_not_strong_anchor"
-        if best["pair_score"] < config.division_min_score:
-            decision = "reject_low_pair_score"
-        elif not best["branches_separate"]:
-            decision = "reject_branch_merge"
-        elif not best["both_persist"]:
-            decision = "reject_not_both_persistent"
-        elif n_competing > 1 and pair_margin < config.division_pair_margin:
-            decision = "reject_ambiguous_pair"
-        else:
-            strong_anchor = (
-                best["existing_edge_prob"] >= strong_existing_edge_min
-                and best["candidate_edge_prob"] >= config.division_min_edge_prob
-                and best["existing_forward_len"] >= strong_branch_persistence_min
-                and best["candidate_forward_len"] >= strong_branch_persistence_min
-                and best["parent_history_len"] >= strong_parent_history_min
+        evidence_candidates = []
+        if (
+            head_prob >= config.division_evidence_head_min
+            and existing_prob >= config.division_evidence_existing_edge_min
+        ):
+            evidence_candidates = [
+                row
+                for row in family_candidates
+                if row["pair_score"] >= config.division_min_score
+                and row["branches_separate"]
+                and row["candidate_edge_prob"]
+                >= config.division_evidence_candidate_edge_min
+            ]
+
+        if evidence_candidates:
+            evidence_candidates.sort(
+                key=lambda row: (
+                    row["pair_score"],
+                    row["candidate_edge_prob"],
+                ),
+                reverse=True,
             )
-            if strong_anchor:
-                decision = "accepted_strong_anchor"
+            best = evidence_candidates[0]
+            n_competing = len(evidence_candidates)
+            second_score = (
+                float(evidence_candidates[1]["pair_score"])
+                if n_competing > 1
+                else None
+            )
+            pair_margin = (
+                float(best["pair_score"] - second_score)
+                if second_score is not None
+                else float("nan")
+            )
+            decision = "accepted_evidence"
+            if n_competing > 1 and pair_margin < config.division_pair_margin:
+                decision = "reject_ambiguous_pair"
+        else:
+            # Audit the strongest raw biological option and state the first
+            # evidence reason it could not enter the V16.3 decision set.
+            best = raw_best
+            n_competing = 0
+            pair_margin = float("nan")
+            if best["pair_score"] < config.division_min_score:
+                decision = "reject_low_pair_score"
+            elif not best["branches_separate"]:
+                decision = "reject_branch_merge"
+            elif head_prob < config.division_evidence_head_min:
+                decision = "reject_low_head_evidence"
+            elif existing_prob < config.division_evidence_existing_edge_min:
+                decision = "reject_low_existing_edge"
+            else:
+                decision = "reject_low_candidate_edge"
 
+        eligible_count += len(family_candidates)
         edge_ratio = (
             best["candidate_edge_prob"] / max(best["existing_edge_prob"], 1e-8)
         )
@@ -895,6 +991,7 @@ def add_precision_divisions_post_ilp(
                 "pds": best["pds"],
                 "pair_margin": pair_margin,
                 "num_competing_candidates": n_competing,
+                "num_raw_family_candidates": len(family_candidates),
                 "existing_forward_len": best["existing_forward_len"],
                 "candidate_forward_len": best["candidate_forward_len"],
                 "parent_history_len": best["parent_history_len"],
@@ -905,7 +1002,7 @@ def add_precision_divisions_post_ilp(
             }
         )
 
-        if decision == "accepted_strong_anchor":
+        if decision == "accepted_evidence":
             best["pair_margin"] = pair_margin
             best["num_competing_candidates"] = n_competing
             best["edge_ratio"] = edge_ratio
@@ -958,11 +1055,11 @@ def add_precision_divisions_post_ilp(
         }
         for row in audit_rows:
             key = (int(row.get("parent", -1)), int(row.get("candidate_child", -1)))
-            if key in selected_keys and row.get("decision") == "accepted_strong_anchor":
+            if key in selected_keys and row.get("decision") == "accepted_evidence":
                 row["decision"] = "accepted"
 
     print(
-        f"[V16.2 RESCUE] video={video_name} "
+        f"[V16.3 RESCUE] video={video_name} "
         f"eligible={eligible_count} "
         f"independent_pass={len(independently_accepted)} "
         f"removed_by_ilp={removed_by_ilp_count} "
@@ -979,7 +1076,7 @@ def add_precision_divisions_post_ilp(
             else "NA"
         )
         print(
-            f"[V16.2 ACCEPT] parent={row['parent']} "
+            f"[V16.3 ACCEPT] parent={row['parent']} "
             f"existing={row['existing_child']} "
             f"rescued={row['candidate_child']} "
             f"pair={row['pair_score']:.3f} "
@@ -1380,16 +1477,33 @@ def predict_video(
                         )
                     ] = probability
 
-            normal_edges = build_normal_associations(
-                probabilities=edge_probabilities,
-                source_coords_ds=source_coords_ds,
-                target_coords_ds=target_coords_ds,
-                source_global_indices=source_global,
-                target_global_indices=target_global,
-                voxel_size_ds=voxel_size_ds,
-                edge_threshold=config.edge_threshold,
-                max_link_distance_um=config.max_link_distance_um,
-            )
+            if config.association_mode == "global":
+                normal_edges = build_global_associations(
+                    probabilities=edge_probabilities,
+                    source_coords_ds=source_coords_ds,
+                    target_coords_ds=target_coords_ds,
+                    source_global_indices=source_global,
+                    target_global_indices=target_global,
+                    voxel_size_ds=voxel_size_ds,
+                    edge_threshold=config.edge_threshold,
+                    max_link_distance_um=config.max_link_distance_um,
+                )
+            elif config.association_mode == "greedy":
+                normal_edges = build_normal_associations(
+                    probabilities=edge_probabilities,
+                    source_coords_ds=source_coords_ds,
+                    target_coords_ds=target_coords_ds,
+                    source_global_indices=source_global,
+                    target_global_indices=target_global,
+                    voxel_size_ds=voxel_size_ds,
+                    edge_threshold=config.edge_threshold,
+                    max_link_distance_um=config.max_link_distance_um,
+                )
+            else:
+                raise ValueError(
+                    f"Unknown association_mode={config.association_mode!r}; "
+                    "expected 'global' or 'greedy'."
+                )
 
             all_edges.extend(normal_edges)
 
@@ -1462,6 +1576,7 @@ def write_audit_csv(
         "pds",
         "pair_margin",
         "num_competing_candidates",
+        "num_raw_family_candidates",
         "existing_forward_len",
         "candidate_forward_len",
         "parent_history_len",
@@ -1585,6 +1700,7 @@ def predict(
         f"device={device}; window={window_size}; "
         f"downsample={downsample}; "
         f"edge_threshold={config.edge_threshold}; "
+        f"association_mode={config.association_mode}; "
         f"division_head_threshold={config.division_head_threshold}",
         flush=True,
     )
@@ -1699,7 +1815,7 @@ def predict(
         )
 
         print(
-            f"[POST-V16.2 RESCUE] {name}: "
+            f"[POST-V16.3 RESCUE] {name}: "
             f"added={added_divisions} "
             f"edges={graph.num_edges()} "
             f"divisions={count_divisions_in_graph(graph)}",
@@ -1770,7 +1886,7 @@ def predict(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Run BioTrack3D++ V16.2 with post-ILP precision-first "
+            "Run BioTrack3D++ V16.3 with post-ILP precision-first "
             "division rescue."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1850,6 +1966,16 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "--association-mode",
+        choices=("global", "greedy"),
+        default="global",
+        help=(
+            "Framewise 1->1 association: global maximum-gain matching "
+            "(V16.3 default) or historical greedy."
+        ),
+    )
+
+    parser.add_argument(
         "--max-link-distance-um",
         type=float,
         default=15.0,
@@ -1870,8 +1996,29 @@ def main() -> None:
     parser.add_argument(
         "--division-min-score",
         type=float,
-        default=0.20,
-        help="Minimum learned 4-feature biology score.",
+        default=0.07,
+        help="Minimum learned 4-feature biology score for V16.3 evidence route.",
+    )
+
+    parser.add_argument(
+        "--division-evidence-head-min",
+        type=float,
+        default=0.83,
+        help="Minimum division-head probability for the V16.3 evidence route.",
+    )
+
+    parser.add_argument(
+        "--division-evidence-existing-edge-min",
+        type=float,
+        default=0.65,
+        help="Minimum neural probability of the already-selected daughter edge.",
+    )
+
+    parser.add_argument(
+        "--division-evidence-candidate-edge-min",
+        type=float,
+        default=0.32,
+        help="Minimum neural probability of the rescued daughter edge.",
     )
 
     parser.add_argument(
@@ -2000,9 +2147,13 @@ def main() -> None:
         pool_kernel_um=args.pool_kernel_um,
         edge_threshold=args.edge_threshold,
         max_link_distance_um=args.max_link_distance_um,
+        association_mode=args.association_mode,
         division_head_threshold=args.division_head_threshold,
         division_min_edge_prob=args.division_min_edge_prob,
         division_min_score=args.division_min_score,
+        division_evidence_head_min=args.division_evidence_head_min,
+        division_evidence_existing_edge_min=args.division_evidence_existing_edge_min,
+        division_evidence_candidate_edge_min=args.division_evidence_candidate_edge_min,
         division_pair_margin=args.division_pair_margin,
         division_single_persist_min_score=args.division_single_persist_min_score,
         division_single_persist_min_edge_prob=args.division_single_persist_min_edge_prob,
@@ -2024,7 +2175,7 @@ def main() -> None:
 
     for fold in folds:
         print(
-            "BioTrack3D++ V16.2: "
+            "BioTrack3D++ V16.3: "
             "strong V15 tracker + precision-first post-ILP division rescue",
             flush=True,
         )
