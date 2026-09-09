@@ -1851,6 +1851,7 @@ def predict(
     method: str,
     debug_video: Path | None,
     video_slice: slice | None,
+    partition: str,
     evaluate: bool,
 ) -> None:
     """Run prediction, save GEFF files, and optionally evaluate."""
@@ -1892,7 +1893,9 @@ def predict(
                 }
             ]
 
-        test_names = folds[fold]["test"]
+        if partition not in {"train", "test"}:
+            raise ValueError(f"partition must be 'train' or 'test', got {partition!r}")
+        test_names = folds[fold][partition]
 
         if video_slice is not None:
             test_names = test_names[video_slice]
@@ -2210,6 +2213,17 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "--partition",
+        choices=("train", "test"),
+        default="test",
+        help=(
+            "Which split partition to predict when --debug-video is not used. "
+            "Default: test. Use train to generate context-model training data "
+            "without contaminating the held-out validation videos."
+        ),
+    )
+
+    parser.add_argument(
         "--evaluate",
         action="store_true",
     )
@@ -2506,6 +2520,7 @@ def main() -> None:
             method=args.method,
             debug_video=debug_video,
             video_slice=video_slice,
+            partition=args.partition,
             evaluate=args.evaluate,
         )
 
