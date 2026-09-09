@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""BioTrack3D++ V16.3.1 edge-global + evidence-calibrated mitosis.
+"""BioTrack3D++ V16.3.2 edge-global + compact-confidence mitosis.
 
 V16.3 targets the two error sources identified by GT diagnostics:
 
@@ -90,7 +90,7 @@ class PredictConfig:
     edge_threshold: float = 0.20
     max_link_distance_um: float = 15.0
 
-    # V16.3.1: global framewise assignment is the default because GT diagnostics
+    # V16.3.2: global framewise assignment is the default because GT diagnostics
     # showed 318/369 edge FNs were association misses. Use "greedy" for A/B.
     association_mode: str = "greedy"
 
@@ -107,7 +107,7 @@ class PredictConfig:
 
     # Learned biology remains a family plausibility/ranking signal. Labeled GT
     # proposals in the first-8 diagnostic include a true pair at ~0.07465, so
-    # the V16.3.1 evidence envelope uses a conservative floor of 0.07.
+    # the V16.3.2 evidence envelope uses a conservative floor of 0.07.
     division_min_score: float = 0.07
 
     # Labeled rescue calibration (5 exact GT pairs vs 3 harmful rescue FPs):
@@ -117,13 +117,16 @@ class PredictConfig:
     division_evidence_existing_edge_min: float = 0.65
     division_evidence_candidate_edge_min: float = 0.32
 
-    # V16.3.1: two GT-supported family-shape routes. Across the first-8
-    # labeled diagnostics these retain all 5 exact true proposals and reject
-    # all 3 known harmful rescue FPs. The compact route captures symmetric
-    # splits; the established route preserves the verified asymmetric 668.
+    # V16.3.2: two GT-supported family-shape routes. The compact route now
+    # requires geometry PLUS either strong two-daughter neural support or a
+    # stronger learned biology score. This keeps all 4 known compact GT pairs
+    # while rejecting the labeled 5c harmful FP parent=18247. The established
+    # route remains unchanged to preserve the verified asymmetric 668 split.
     division_compact_angle_min: float = 115.0
     division_compact_pds_min: float = 0.70
     division_compact_midpoint_max_um: float = 2.60
+    division_compact_min_daughter_edge_strong: float = 0.70
+    division_compact_pair_score_strong: float = 0.16
 
     division_established_existing_edge_min: float = 0.88
     division_established_candidate_edge_min: float = 0.40
@@ -917,8 +920,10 @@ def add_precision_divisions_post_ilp(
         if not family_candidates:
             continue
 
-        # V16.3.1 selection: neural evidence first, then require one of two
-        # GT-supported family shapes before biology chooses the best daughter
+        # V16.3.2 selection: neural evidence first, then require one of two
+        # GT-supported family routes. Compact geometry additionally needs either
+        # strong two-daughter neural support or stronger learned biology before
+        # biology chooses the best daughter
         # within THIS parent. This keeps the atlas score as local ranking,
         # rather than a global mitosis probability.
         raw_best = max(
@@ -942,11 +947,30 @@ def add_precision_divisions_post_ilp(
                 ):
                     continue
 
-                route_compact = (
+                compact_geometry = (
                     row["angle_deg"] >= config.division_compact_angle_min
                     and row["pds"] >= config.division_compact_pds_min
                     and row["midpoint_error_um"]
                     <= config.division_compact_midpoint_max_um
+                )
+                compact_min_daughter_edge = min(
+                    row["existing_edge_prob"],
+                    row["candidate_edge_prob"],
+                )
+                compact_neural_confidence = (
+                    compact_min_daughter_edge
+                    >= config.division_compact_min_daughter_edge_strong
+                )
+                compact_biology_confidence = (
+                    row["pair_score"]
+                    >= config.division_compact_pair_score_strong
+                )
+                route_compact = (
+                    compact_geometry
+                    and (
+                        compact_neural_confidence
+                        or compact_biology_confidence
+                    )
                 )
 
                 route_established = (
@@ -963,6 +987,11 @@ def add_precision_divisions_post_ilp(
                     and row["candidate_forward_len"]
                     >= config.division_established_forward_min
                 )
+
+                row["compact_geometry"] = bool(compact_geometry)
+                row["compact_min_daughter_edge"] = float(compact_min_daughter_edge)
+                row["compact_neural_confidence"] = bool(compact_neural_confidence)
+                row["compact_biology_confidence"] = bool(compact_biology_confidence)
 
                 if route_compact or route_established:
                     row["route_compact"] = bool(route_compact)
@@ -1001,11 +1030,15 @@ def add_precision_divisions_post_ilp(
                 decision = "reject_ambiguous_pair"
         else:
             # Audit the strongest raw biological option and state why it could
-            # not enter either V16.3.1 family route.
+            # not enter either V16.3.2 family route.
             best = raw_best
             best["route_compact"] = False
             best["route_established"] = False
             best["route_name"] = "none"
+            best.setdefault("compact_geometry", False)
+            best.setdefault("compact_min_daughter_edge", float("nan"))
+            best.setdefault("compact_neural_confidence", False)
+            best.setdefault("compact_biology_confidence", False)
             n_competing = 0
             pair_margin = float("nan")
             if best["pair_score"] < config.division_min_score:
@@ -1056,6 +1089,16 @@ def add_precision_divisions_post_ilp(
                 # Keep this column for CSV compatibility, but it is no longer a
                 # global ranking score. Store the edge ratio for diagnostics.
                 "priority": edge_ratio,
+                "compact_geometry": bool(best.get("compact_geometry", False)),
+                "compact_min_daughter_edge": best.get(
+                    "compact_min_daughter_edge", float("nan")
+                ),
+                "compact_neural_confidence": bool(
+                    best.get("compact_neural_confidence", False)
+                ),
+                "compact_biology_confidence": bool(
+                    best.get("compact_biology_confidence", False)
+                ),
                 "route_compact": bool(best.get("route_compact", False)),
                 "route_established": bool(best.get("route_established", False)),
                 "route_name": best.get("route_name", "none"),
@@ -1120,7 +1163,7 @@ def add_precision_divisions_post_ilp(
                 row["decision"] = "accepted"
 
     print(
-        f"[V16.3.1 RESCUE] video={video_name} "
+        f"[V16.3.2 RESCUE] video={video_name} "
         f"eligible={eligible_count} "
         f"independent_pass={len(independently_accepted)} "
         f"removed_by_ilp={removed_by_ilp_count} "
@@ -1137,7 +1180,7 @@ def add_precision_divisions_post_ilp(
             else "NA"
         )
         print(
-            f"[V16.3.1 ACCEPT] parent={row['parent']} "
+            f"[V16.3.2 ACCEPT] parent={row['parent']} "
             f"existing={row['existing_child']} "
             f"rescued={row['candidate_child']} "
             f"pair={row['pair_score']:.3f} "
@@ -1643,6 +1686,10 @@ def write_audit_csv(
         "candidate_forward_len",
         "parent_history_len",
         "priority",
+        "compact_geometry",
+        "compact_min_daughter_edge",
+        "compact_neural_confidence",
+        "compact_biology_confidence",
         "route_compact",
         "route_established",
         "route_name",
@@ -1880,7 +1927,7 @@ def predict(
         )
 
         print(
-            f"[POST-V16.3 RESCUE] {name}: "
+            f"[POST-V16.3.2 RESCUE] {name}: "
             f"added={added_divisions} "
             f"edges={graph.num_edges()} "
             f"divisions={count_divisions_in_graph(graph)}",
@@ -1951,7 +1998,7 @@ def predict(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Run BioTrack3D++ V16.3.1 with post-ILP precision-first "
+            "Run BioTrack3D++ V16.3.2 with post-ILP precision-first "
             "division rescue."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -2035,7 +2082,7 @@ def main() -> None:
         choices=("global", "greedy"),
         default="greedy",
         help=(
-            "Framewise 1->1 association: historical greedy (V16.3.1 default) "
+            "Framewise 1->1 association: historical greedy (V16.3.2 default) "
             "or experimental global maximum-gain matching."
         ),
     )
@@ -2062,14 +2109,14 @@ def main() -> None:
         "--division-min-score",
         type=float,
         default=0.07,
-        help="Minimum learned 4-feature biology score for V16.3.1 evidence envelope.",
+        help="Minimum learned 4-feature biology score for V16.3.2 evidence envelope.",
     )
 
     parser.add_argument(
         "--division-evidence-head-min",
         type=float,
         default=0.83,
-        help="Minimum division-head probability for the V16.3.1 evidence envelope.",
+        help="Minimum division-head probability for the V16.3.2 evidence envelope.",
     )
 
     parser.add_argument(
@@ -2084,6 +2131,26 @@ def main() -> None:
         type=float,
         default=0.32,
         help="Minimum neural probability of the rescued daughter edge.",
+    )
+
+    parser.add_argument(
+        "--division-compact-min-daughter-edge-strong",
+        type=float,
+        default=0.70,
+        help=(
+            "Compact-route strong-neural branch: minimum of the two daughter "
+            "edge probabilities."
+        ),
+    )
+
+    parser.add_argument(
+        "--division-compact-pair-score-strong",
+        type=float,
+        default=0.16,
+        help=(
+            "Compact-route biology branch: learned pair-score threshold used "
+            "when the two daughter edges are not both >= the strong-neural floor."
+        ),
     )
 
     parser.add_argument(
@@ -2219,6 +2286,10 @@ def main() -> None:
         division_evidence_head_min=args.division_evidence_head_min,
         division_evidence_existing_edge_min=args.division_evidence_existing_edge_min,
         division_evidence_candidate_edge_min=args.division_evidence_candidate_edge_min,
+        division_compact_min_daughter_edge_strong=(
+            args.division_compact_min_daughter_edge_strong
+        ),
+        division_compact_pair_score_strong=args.division_compact_pair_score_strong,
         division_pair_margin=args.division_pair_margin,
         division_single_persist_min_score=args.division_single_persist_min_score,
         division_single_persist_min_edge_prob=args.division_single_persist_min_edge_prob,
@@ -2240,7 +2311,7 @@ def main() -> None:
 
     for fold in folds:
         print(
-            "BioTrack3D++ V16.3.1: "
+            "BioTrack3D++ V16.3.2: "
             "strong V15 tracker + precision-first post-ILP division rescue",
             flush=True,
         )
