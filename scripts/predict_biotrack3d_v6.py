@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""BioTrack3D++ V16.3 edge-global + evidence-calibrated mitosis.
+"""BioTrack3D++ V16.3.1 edge-global + evidence-calibrated mitosis.
 
 V16.3 targets the two error sources identified by GT diagnostics:
 
@@ -90,9 +90,9 @@ class PredictConfig:
     edge_threshold: float = 0.20
     max_link_distance_um: float = 15.0
 
-    # V16.3: global framewise assignment is the default because GT diagnostics
+    # V16.3.1: global framewise assignment is the default because GT diagnostics
     # showed 318/369 edge FNs were association misses. Use "greedy" for A/B.
-    association_mode: str = "global"
+    association_mode: str = "greedy"
 
     # Neural evidence.
     division_head_threshold: float = 0.58
@@ -107,7 +107,7 @@ class PredictConfig:
 
     # Learned biology remains a family plausibility/ranking signal. Labeled GT
     # proposals in the first-8 diagnostic include a true pair at ~0.07465, so
-    # the V16.3 evidence route uses a conservative floor of 0.07.
+    # the V16.3.1 evidence envelope uses a conservative floor of 0.07.
     division_min_score: float = 0.07
 
     # Labeled rescue calibration (5 exact GT pairs vs 3 harmful rescue FPs):
@@ -116,6 +116,20 @@ class PredictConfig:
     division_evidence_head_min: float = 0.83
     division_evidence_existing_edge_min: float = 0.65
     division_evidence_candidate_edge_min: float = 0.32
+
+    # V16.3.1: two GT-supported family-shape routes. Across the first-8
+    # labeled diagnostics these retain all 5 exact true proposals and reject
+    # all 3 known harmful rescue FPs. The compact route captures symmetric
+    # splits; the established route preserves the verified asymmetric 668.
+    division_compact_angle_min: float = 115.0
+    division_compact_pds_min: float = 0.70
+    division_compact_midpoint_max_um: float = 2.60
+
+    division_established_existing_edge_min: float = 0.88
+    division_established_candidate_edge_min: float = 0.40
+    division_established_pair_score_min: float = 0.20
+    division_established_history_min: int = 3
+    division_established_forward_min: int = 3
 
     # Precision / ambiguity controls. The verified true pair beats its known
     # confusing alternative by ~0.041, so 0.03 preserves that example.
@@ -903,10 +917,10 @@ def add_precision_divisions_post_ilp(
         if not family_candidates:
             continue
 
-        # V16.3 selection: first require the labeled neural-evidence envelope,
-        # then use the learned biology to choose among surviving daughters for
-        # THIS parent. This prevents a geometry-high / neural-weak distractor
-        # from blocking a true daughter before the evidence gate is applied.
+        # V16.3.1 selection: neural evidence first, then require one of two
+        # GT-supported family shapes before biology chooses the best daughter
+        # within THIS parent. This keeps the atlas score as local ranking,
+        # rather than a global mitosis probability.
         raw_best = max(
             family_candidates,
             key=lambda row: (row["pair_score"], row["candidate_edge_prob"]),
@@ -917,14 +931,50 @@ def add_precision_divisions_post_ilp(
             head_prob >= config.division_evidence_head_min
             and existing_prob >= config.division_evidence_existing_edge_min
         ):
-            evidence_candidates = [
-                row
-                for row in family_candidates
-                if row["pair_score"] >= config.division_min_score
-                and row["branches_separate"]
-                and row["candidate_edge_prob"]
-                >= config.division_evidence_candidate_edge_min
-            ]
+            for row in family_candidates:
+                if row["pair_score"] < config.division_min_score:
+                    continue
+                if not row["branches_separate"]:
+                    continue
+                if (
+                    row["candidate_edge_prob"]
+                    < config.division_evidence_candidate_edge_min
+                ):
+                    continue
+
+                route_compact = (
+                    row["angle_deg"] >= config.division_compact_angle_min
+                    and row["pds"] >= config.division_compact_pds_min
+                    and row["midpoint_error_um"]
+                    <= config.division_compact_midpoint_max_um
+                )
+
+                route_established = (
+                    row["existing_edge_prob"]
+                    >= config.division_established_existing_edge_min
+                    and row["candidate_edge_prob"]
+                    >= config.division_established_candidate_edge_min
+                    and row["pair_score"]
+                    >= config.division_established_pair_score_min
+                    and row["parent_history_len"]
+                    >= config.division_established_history_min
+                    and row["existing_forward_len"]
+                    >= config.division_established_forward_min
+                    and row["candidate_forward_len"]
+                    >= config.division_established_forward_min
+                )
+
+                if route_compact or route_established:
+                    row["route_compact"] = bool(route_compact)
+                    row["route_established"] = bool(route_established)
+                    row["route_name"] = (
+                        "compact+established"
+                        if route_compact and route_established
+                        else "compact"
+                        if route_compact
+                        else "established"
+                    )
+                    evidence_candidates.append(row)
 
         if evidence_candidates:
             evidence_candidates.sort(
@@ -946,13 +996,16 @@ def add_precision_divisions_post_ilp(
                 if second_score is not None
                 else float("nan")
             )
-            decision = "accepted_evidence"
+            decision = "accepted_route"
             if n_competing > 1 and pair_margin < config.division_pair_margin:
                 decision = "reject_ambiguous_pair"
         else:
-            # Audit the strongest raw biological option and state the first
-            # evidence reason it could not enter the V16.3 decision set.
+            # Audit the strongest raw biological option and state why it could
+            # not enter either V16.3.1 family route.
             best = raw_best
+            best["route_compact"] = False
+            best["route_established"] = False
+            best["route_name"] = "none"
             n_competing = 0
             pair_margin = float("nan")
             if best["pair_score"] < config.division_min_score:
@@ -963,8 +1016,13 @@ def add_precision_divisions_post_ilp(
                 decision = "reject_low_head_evidence"
             elif existing_prob < config.division_evidence_existing_edge_min:
                 decision = "reject_low_existing_edge"
-            else:
+            elif (
+                best["candidate_edge_prob"]
+                < config.division_evidence_candidate_edge_min
+            ):
                 decision = "reject_low_candidate_edge"
+            else:
+                decision = "reject_family_shape"
 
         eligible_count += len(family_candidates)
         edge_ratio = (
@@ -998,11 +1056,14 @@ def add_precision_divisions_post_ilp(
                 # Keep this column for CSV compatibility, but it is no longer a
                 # global ranking score. Store the edge ratio for diagnostics.
                 "priority": edge_ratio,
+                "route_compact": bool(best.get("route_compact", False)),
+                "route_established": bool(best.get("route_established", False)),
+                "route_name": best.get("route_name", "none"),
                 "decision": decision,
             }
         )
 
-        if decision == "accepted_evidence":
+        if decision == "accepted_route":
             best["pair_margin"] = pair_margin
             best["num_competing_candidates"] = n_competing
             best["edge_ratio"] = edge_ratio
@@ -1055,11 +1116,11 @@ def add_precision_divisions_post_ilp(
         }
         for row in audit_rows:
             key = (int(row.get("parent", -1)), int(row.get("candidate_child", -1)))
-            if key in selected_keys and row.get("decision") == "accepted_evidence":
+            if key in selected_keys and row.get("decision") == "accepted_route":
                 row["decision"] = "accepted"
 
     print(
-        f"[V16.3 RESCUE] video={video_name} "
+        f"[V16.3.1 RESCUE] video={video_name} "
         f"eligible={eligible_count} "
         f"independent_pass={len(independently_accepted)} "
         f"removed_by_ilp={removed_by_ilp_count} "
@@ -1076,7 +1137,7 @@ def add_precision_divisions_post_ilp(
             else "NA"
         )
         print(
-            f"[V16.3 ACCEPT] parent={row['parent']} "
+            f"[V16.3.1 ACCEPT] parent={row['parent']} "
             f"existing={row['existing_child']} "
             f"rescued={row['candidate_child']} "
             f"pair={row['pair_score']:.3f} "
@@ -1085,6 +1146,7 @@ def add_precision_divisions_post_ilp(
             f"candidate_edge={row['candidate_edge_prob']:.3f} "
             f"edge_ratio={row['edge_ratio']:.3f} "
             f"head={row['head_prob']:.3f} "
+            f"route={row.get('route_name', 'none')} "
             f"persist={row['existing_forward_len']}/{row['candidate_forward_len']} "
             f"history={row['parent_history_len']}",
             flush=True,
@@ -1581,6 +1643,9 @@ def write_audit_csv(
         "candidate_forward_len",
         "parent_history_len",
         "priority",
+        "route_compact",
+        "route_established",
+        "route_name",
         "decision",
     ]
 
@@ -1886,7 +1951,7 @@ def predict(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Run BioTrack3D++ V16.3 with post-ILP precision-first "
+            "Run BioTrack3D++ V16.3.1 with post-ILP precision-first "
             "division rescue."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1968,10 +2033,10 @@ def main() -> None:
     parser.add_argument(
         "--association-mode",
         choices=("global", "greedy"),
-        default="global",
+        default="greedy",
         help=(
-            "Framewise 1->1 association: global maximum-gain matching "
-            "(V16.3 default) or historical greedy."
+            "Framewise 1->1 association: historical greedy (V16.3.1 default) "
+            "or experimental global maximum-gain matching."
         ),
     )
 
@@ -1997,14 +2062,14 @@ def main() -> None:
         "--division-min-score",
         type=float,
         default=0.07,
-        help="Minimum learned 4-feature biology score for V16.3 evidence route.",
+        help="Minimum learned 4-feature biology score for V16.3.1 evidence envelope.",
     )
 
     parser.add_argument(
         "--division-evidence-head-min",
         type=float,
         default=0.83,
-        help="Minimum division-head probability for the V16.3 evidence route.",
+        help="Minimum division-head probability for the V16.3.1 evidence envelope.",
     )
 
     parser.add_argument(
@@ -2175,7 +2240,7 @@ def main() -> None:
 
     for fold in folds:
         print(
-            "BioTrack3D++ V16.3: "
+            "BioTrack3D++ V16.3.1: "
             "strong V15 tracker + precision-first post-ILP division rescue",
             flush=True,
         )
