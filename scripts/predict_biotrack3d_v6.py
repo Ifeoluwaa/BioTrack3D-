@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""BioTrack3D++ V16.3.2 edge-global + compact-confidence mitosis.
+"""BioTrack3D++ V16.4a: V16.3.2 + precision close-sister mitosis route.
 
 V16.3 targets the two error sources identified by GT diagnostics:
 
@@ -103,6 +103,16 @@ class PredictConfig:
     division_sister_min_um: float = 7.0
     division_sister_max_um: float = 15.3
     division_midpoint_max_um: float = 6.0
+
+    # V16.4a controlled experiment: two verified GT misses had strong neural
+    # evidence but predicted sister distances of 6.08 and 5.39 um. Do NOT
+    # globally relax the atlas gate. Admit 5-7 um only through a separate
+    # strong-neural route; normal compact/established routes still require
+    # the original 7-15.3 um atlas interval.
+    division_close_sister_min_um: float = 5.0
+    division_close_sister_head_min: float = 0.85
+    division_close_sister_existing_edge_min: float = 0.85
+    division_close_sister_candidate_edge_min: float = 0.55
     division_existing_child_max_um: float = 10.4
 
     # Learned biology remains a family plausibility/ranking signal. Labeled GT
@@ -154,13 +164,6 @@ class PredictConfig:
     ilp_division_weight: float = 1.0
 
     audit_csv: Path | None = None
-    # Diagnostic only: global parent indices to trace through every pre-audit gate.
-    trace_division_parents: tuple[int, ...] = ()
-    # Diagnostic only: exact (source_global,target_global) pairs whose neural edge
-    # probability is retained even when below division_min_edge_prob. This does
-    # not alter prediction logic because the normal generator still rejects
-    # below-floor edges.
-    trace_division_pairs: tuple[tuple[int, int], ...] = ()
 
 
 _DEFAULT_CONFIG = {
@@ -813,39 +816,23 @@ def add_precision_divisions_post_ilp(
     independently_accepted: list[dict] = []
     eligible_count = 0
     removed_by_ilp_count = 0
-    trace_parents = {int(x) for x in config.trace_division_parents}
 
     for parent, children in outgoing.items():
-        trace = parent in trace_parents
-        if trace:
-            print(
-                f"[DIVTRACE START] video={video_name} parent={parent} "
-                f"children={[(int(c), float(p), float(d)) for c,p,d in children]} "
-                f"incoming={incoming_sources.get(parent, [])} "
-                f"head={float(division_head_prob_by_global.get(parent, 0.0)):.6f} "
-                f"raw_candidates={sorted(raw_by_parent.get(parent, []), key=lambda x: -x[1])}",
-                flush=True,
-            )
         # Complete only a 1->1 family. Never rewrite topology here.
         if len(children) != 1:
-            if trace: print(f"[DIVTRACE STOP] parent={parent} reason=parent_outdegree_{len(children)}", flush=True)
             continue
         if len(incoming_sources.get(parent, [])) == 0:
-            if trace: print(f"[DIVTRACE STOP] parent={parent} reason=no_incoming_history", flush=True)
             continue
 
         existing, existing_prob, existing_dist = children[0]
         parent_time = int(coords_ds[parent, 0])
         if int(coords_ds[existing, 0]) != parent_time + 1:
-            if trace: print(f"[DIVTRACE STOP] parent={parent} reason=existing_wrong_time existing={existing}", flush=True)
             continue
         if existing_dist > config.division_existing_child_max_um:
-            if trace: print(f"[DIVTRACE STOP] parent={parent} reason=existing_too_far existing_dist={existing_dist:.6f} max={config.division_existing_child_max_um}", flush=True)
             continue
 
         head_prob = float(division_head_prob_by_global.get(parent, 0.0))
         if head_prob < config.division_head_threshold:
-            if trace: print(f"[DIVTRACE STOP] parent={parent} reason=head_below_generator_floor head={head_prob:.6f} floor={config.division_head_threshold}", flush=True)
             continue
 
         parent_xyz = coords_ds[parent, 1:].astype(np.float32)
@@ -853,54 +840,52 @@ def add_precision_divisions_post_ilp(
         family_candidates: list[dict] = []
 
         for candidate, raw_edge_prob in raw_by_parent.get(parent, []):
-            if trace:
-                print(f"[DIVTRACE CAND] parent={parent} candidate={candidate} raw_edge={raw_edge_prob:.6f}", flush=True)
             if candidate == existing or (parent, candidate) in edge_set:
-                if trace: print(f"[DIVTRACE REJECT] parent={parent} candidate={candidate} reason=already_existing_child_or_edge", flush=True)
                 continue
             if raw_edge_prob < config.division_min_edge_prob:
-                if trace: print(f"[DIVTRACE REJECT] parent={parent} candidate={candidate} reason=raw_edge_below_floor raw={raw_edge_prob:.6f} floor={config.division_min_edge_prob}", flush=True)
                 continue
             if int(coords_ds[candidate, 0]) != parent_time + 1:
-                if trace: print(f"[DIVTRACE REJECT] parent={parent} candidate={candidate} reason=wrong_time cand_t={int(coords_ds[candidate,0])} expected={parent_time+1}", flush=True)
                 continue
 
             candidate_node_id = global_to_node_id[int(candidate)]
             if candidate_node_id not in surviving_node_ids:
                 removed_by_ilp_count += 1
-                if trace: print(f"[DIVTRACE REJECT] parent={parent} candidate={candidate} reason=removed_by_ilp node_id={candidate_node_id}", flush=True)
                 continue
 
             # Candidate must survive ILP and be genuinely parent-free.
             if len(incoming_sources.get(candidate, [])) != 0:
-                if trace: print(f"[DIVTRACE REJECT] parent={parent} candidate={candidate} reason=candidate_already_claimed claims={incoming_sources.get(candidate, [])}", flush=True)
                 continue
 
             candidate_xyz = coords_ds[candidate, 1:].astype(np.float32)
             candidate_dist = physical_distance(parent_xyz, candidate_xyz, voxel_size_ds)
             if candidate_dist > config.division_parent_max_um:
-                if trace: print(f"[DIVTRACE REJECT] parent={parent} candidate={candidate} reason=parent_distance dist={candidate_dist:.6f} max={config.division_parent_max_um}", flush=True)
                 continue
 
             sister_dist = physical_distance(existing_xyz, candidate_xyz, voxel_size_ds)
-            if not (
+            sister_in_atlas = (
                 config.division_sister_min_um
                 <= sister_dist
                 <= config.division_sister_max_um
-            ):
-                if trace: print(f"[DIVTRACE REJECT] parent={parent} candidate={candidate} reason=sister_distance sister={sister_dist:.6f} range=[{config.division_sister_min_um},{config.division_sister_max_um}]", flush=True)
+            )
+            sister_in_close_band = (
+                config.division_close_sister_min_um
+                <= sister_dist
+                < config.division_sister_min_um
+            )
+            # Preserve the atlas upper bound. The only broadened generator
+            # region is 5-7 um, which must later pass the dedicated V16.4a
+            # strong-neural close-sister route.
+            if not (sister_in_atlas or sister_in_close_band):
                 continue
 
             midpoint_xyz = 0.5 * (existing_xyz + candidate_xyz)
             midpoint_error = physical_distance(parent_xyz, midpoint_xyz, voxel_size_ds)
             if midpoint_error > config.division_midpoint_max_um:
-                if trace: print(f"[DIVTRACE REJECT] parent={parent} candidate={candidate} reason=midpoint midpoint={midpoint_error:.6f} max={config.division_midpoint_max_um}", flush=True)
                 continue
 
             d1 = float(existing_dist)
             d2 = float(candidate_dist)
             if max(d1, d2) <= 1e-8:
-                if trace: print(f"[DIVTRACE REJECT] parent={parent} candidate={candidate} reason=degenerate_geometry", flush=True)
                 continue
 
             pds = min(d1, d2) / max(d1, d2)
@@ -939,6 +924,8 @@ def add_precision_divisions_post_ilp(
                     "existing_dist_um": d1,
                     "candidate_dist_um": d2,
                     "sister_dist_um": sister_dist,
+                    "sister_in_atlas": bool(sister_in_atlas),
+                    "sister_in_close_band": bool(sister_in_close_band),
                     "midpoint_error_um": midpoint_error,
                     "angle_deg": angle,
                     "pds": pds,
@@ -950,18 +937,8 @@ def add_precision_divisions_post_ilp(
                     "branches_separate": branches_separate,
                 }
             )
-            if trace:
-                print(
-                    f"[DIVTRACE PASS_GEOM] parent={parent} candidate={candidate} "
-                    f"raw={raw_edge_prob:.6f} parent_dist={candidate_dist:.6f} "
-                    f"sister={sister_dist:.6f} midpoint={midpoint_error:.6f} "
-                    f"angle={angle:.3f} pds={pds:.6f} pair={pair_score:.6f} "
-                    f"persist={existing_forward}/{candidate_forward} history={parent_history}",
-                    flush=True,
-                )
 
         if not family_candidates:
-            if trace: print(f"[DIVTRACE STOP] parent={parent} reason=no_family_candidates_after_generator_gates", flush=True)
             continue
 
         # V16.3.2 selection: neural evidence first, then require one of two
@@ -981,8 +958,6 @@ def add_precision_divisions_post_ilp(
             and existing_prob >= config.division_evidence_existing_edge_min
         ):
             for row in family_candidates:
-                if row["pair_score"] < config.division_min_score:
-                    continue
                 if not row["branches_separate"]:
                     continue
                 if (
@@ -991,8 +966,11 @@ def add_precision_divisions_post_ilp(
                 ):
                     continue
 
+                normal_pair_ok = row["pair_score"] >= config.division_min_score
+
                 compact_geometry = (
-                    row["angle_deg"] >= config.division_compact_angle_min
+                    row["sister_in_atlas"]
+                    and row["angle_deg"] >= config.division_compact_angle_min
                     and row["pds"] >= config.division_compact_pds_min
                     and row["midpoint_error_um"]
                     <= config.division_compact_midpoint_max_um
@@ -1010,7 +988,8 @@ def add_precision_divisions_post_ilp(
                     >= config.division_compact_pair_score_strong
                 )
                 route_compact = (
-                    compact_geometry
+                    normal_pair_ok
+                    and compact_geometry
                     and (
                         compact_neural_confidence
                         or compact_biology_confidence
@@ -1018,7 +997,9 @@ def add_precision_divisions_post_ilp(
                 )
 
                 route_established = (
-                    row["existing_edge_prob"]
+                    normal_pair_ok
+                    and row["sister_in_atlas"]
+                    and row["existing_edge_prob"]
                     >= config.division_established_existing_edge_min
                     and row["candidate_edge_prob"]
                     >= config.division_established_candidate_edge_min
@@ -1032,21 +1013,36 @@ def add_precision_divisions_post_ilp(
                     >= config.division_established_forward_min
                 )
 
+                route_close_sister = (
+                    row["sister_in_close_band"]
+                    and row["head_prob"]
+                    >= config.division_close_sister_head_min
+                    and row["existing_edge_prob"]
+                    >= config.division_close_sister_existing_edge_min
+                    and row["candidate_edge_prob"]
+                    >= config.division_close_sister_candidate_edge_min
+                    # Parent distance <=11 and midpoint <=6 were already
+                    # enforced by the unchanged generator hard gates.
+                )
+
                 row["compact_geometry"] = bool(compact_geometry)
                 row["compact_min_daughter_edge"] = float(compact_min_daughter_edge)
                 row["compact_neural_confidence"] = bool(compact_neural_confidence)
                 row["compact_biology_confidence"] = bool(compact_biology_confidence)
 
-                if route_compact or route_established:
+                row["route_close_sister"] = bool(route_close_sister)
+
+                if route_compact or route_established or route_close_sister:
                     row["route_compact"] = bool(route_compact)
                     row["route_established"] = bool(route_established)
-                    row["route_name"] = (
-                        "compact+established"
-                        if route_compact and route_established
-                        else "compact"
-                        if route_compact
-                        else "established"
-                    )
+                    active_routes = []
+                    if route_compact:
+                        active_routes.append("compact")
+                    if route_established:
+                        active_routes.append("established")
+                    if route_close_sister:
+                        active_routes.append("close_sister")
+                    row["route_name"] = "+".join(active_routes)
                     evidence_candidates.append(row)
 
         if evidence_candidates:
@@ -1078,6 +1074,7 @@ def add_precision_divisions_post_ilp(
             best = raw_best
             best["route_compact"] = False
             best["route_established"] = False
+            best["route_close_sister"] = False
             best["route_name"] = "none"
             best.setdefault("compact_geometry", False)
             best.setdefault("compact_min_daughter_edge", float("nan"))
@@ -1145,6 +1142,9 @@ def add_precision_divisions_post_ilp(
                 ),
                 "route_compact": bool(best.get("route_compact", False)),
                 "route_established": bool(best.get("route_established", False)),
+                "route_close_sister": bool(best.get("route_close_sister", False)),
+                "sister_in_atlas": bool(best.get("sister_in_atlas", False)),
+                "sister_in_close_band": bool(best.get("sister_in_close_band", False)),
                 "route_name": best.get("route_name", "none"),
                 "decision": decision,
             }
@@ -1207,7 +1207,7 @@ def add_precision_divisions_post_ilp(
                 row["decision"] = "accepted"
 
     print(
-        f"[V16.3.2 RESCUE] video={video_name} "
+        f"[V16.4a RESCUE] video={video_name} "
         f"eligible={eligible_count} "
         f"independent_pass={len(independently_accepted)} "
         f"removed_by_ilp={removed_by_ilp_count} "
@@ -1224,7 +1224,7 @@ def add_precision_divisions_post_ilp(
             else "NA"
         )
         print(
-            f"[V16.3.2 ACCEPT] parent={row['parent']} "
+            f"[V16.4a ACCEPT] parent={row['parent']} "
             f"existing={row['existing_child']} "
             f"rescued={row['candidate_child']} "
             f"pair={row['pair_score']:.3f} "
@@ -1328,9 +1328,6 @@ def predict_video(
 
     all_edges: list[tuple[int, int, float, float]] = []
     candidate_edges_by_pair: dict[tuple[int, int], float] = {}
-    trace_division_pair_set = {
-        (int(src), int(tgt)) for src, tgt in config.trace_division_pairs
-    }
     division_head_by_global: dict[int, float] = {}
 
     global_node_count = 0
@@ -1611,6 +1608,9 @@ def predict_video(
                         ]
                     )
 
+                    if probability < config.division_min_edge_prob:
+                        continue
+
                     source_global_id = int(
                         source_global[source_local]
                     )
@@ -1619,11 +1619,12 @@ def predict_video(
                         target_global[target_local]
                     )
 
-                    pair_key = (source_global_id, target_global_id)
-                    if probability < config.division_min_edge_prob and pair_key not in trace_division_pair_set:
-                        continue
-
-                    candidate_edges_by_pair[pair_key] = probability
+                    candidate_edges_by_pair[
+                        (
+                            source_global_id,
+                            target_global_id,
+                        )
+                    ] = probability
 
             if config.association_mode == "global":
                 normal_edges = build_global_associations(
@@ -1735,6 +1736,9 @@ def write_audit_csv(
         "compact_biology_confidence",
         "route_compact",
         "route_established",
+        "route_close_sister",
+        "sister_in_atlas",
+        "sister_in_close_band",
         "route_name",
         "decision",
     ]
@@ -1970,7 +1974,7 @@ def predict(
         )
 
         print(
-            f"[POST-V16.3.2 RESCUE] {name}: "
+            f"[POST-V16.4a RESCUE] {name}: "
             f"added={added_divisions} "
             f"edges={graph.num_edges()} "
             f"divisions={count_divisions_in_graph(graph)}",
@@ -2127,24 +2131,6 @@ def main() -> None:
         help=(
             "Framewise 1->1 association: historical greedy (V16.3.2 default) "
             "or experimental global maximum-gain matching."
-        ),
-    )
-
-    parser.add_argument(
-        "--trace-division-parents",
-        type=str,
-        default="",
-        help="Diagnostic only: comma-separated global parent indices to trace through pre-audit division gates.",
-    )
-
-    parser.add_argument(
-        "--trace-division-pairs",
-        type=str,
-        default="",
-        help=(
-            "Diagnostic only: comma-separated source:target global-index pairs, "
-            "e.g. 8194:8284,8508:8612. Exact neural probabilities are retained "
-            "for tracing even when below the normal division edge floor."
         ),
     )
 
@@ -2362,16 +2348,6 @@ def main() -> None:
         ilp_disappearance_weight=args.ilp_disappearance_weight,
         ilp_division_weight=args.ilp_division_weight,
         audit_csv=audit_csv,
-        trace_division_parents=tuple(
-            int(x.strip())
-            for x in args.trace_division_parents.split(",")
-            if x.strip()
-        ),
-        trace_division_pairs=tuple(
-            tuple(int(v.strip()) for v in item.split(":", 1))
-            for item in args.trace_division_pairs.split(",")
-            if item.strip()
-        ),
     )
 
     folds = (
