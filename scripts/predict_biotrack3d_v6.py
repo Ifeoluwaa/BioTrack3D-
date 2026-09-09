@@ -154,6 +154,8 @@ class PredictConfig:
     ilp_division_weight: float = 1.0
 
     audit_csv: Path | None = None
+    # Diagnostic only: global parent indices to trace through every pre-audit gate.
+    trace_division_parents: tuple[int, ...] = ()
 
 
 _DEFAULT_CONFIG = {
@@ -806,23 +808,39 @@ def add_precision_divisions_post_ilp(
     independently_accepted: list[dict] = []
     eligible_count = 0
     removed_by_ilp_count = 0
+    trace_parents = {int(x) for x in config.trace_division_parents}
 
     for parent, children in outgoing.items():
+        trace = parent in trace_parents
+        if trace:
+            print(
+                f"[DIVTRACE START] video={video_name} parent={parent} "
+                f"children={[(int(c), float(p), float(d)) for c,p,d in children]} "
+                f"incoming={incoming_sources.get(parent, [])} "
+                f"head={float(division_head_prob_by_global.get(parent, 0.0)):.6f} "
+                f"raw_candidates={sorted(raw_by_parent.get(parent, []), key=lambda x: -x[1])}",
+                flush=True,
+            )
         # Complete only a 1->1 family. Never rewrite topology here.
         if len(children) != 1:
+            if trace: print(f"[DIVTRACE STOP] parent={parent} reason=parent_outdegree_{len(children)}", flush=True)
             continue
         if len(incoming_sources.get(parent, [])) == 0:
+            if trace: print(f"[DIVTRACE STOP] parent={parent} reason=no_incoming_history", flush=True)
             continue
 
         existing, existing_prob, existing_dist = children[0]
         parent_time = int(coords_ds[parent, 0])
         if int(coords_ds[existing, 0]) != parent_time + 1:
+            if trace: print(f"[DIVTRACE STOP] parent={parent} reason=existing_wrong_time existing={existing}", flush=True)
             continue
         if existing_dist > config.division_existing_child_max_um:
+            if trace: print(f"[DIVTRACE STOP] parent={parent} reason=existing_too_far existing_dist={existing_dist:.6f} max={config.division_existing_child_max_um}", flush=True)
             continue
 
         head_prob = float(division_head_prob_by_global.get(parent, 0.0))
         if head_prob < config.division_head_threshold:
+            if trace: print(f"[DIVTRACE STOP] parent={parent} reason=head_below_generator_floor head={head_prob:.6f} floor={config.division_head_threshold}", flush=True)
             continue
 
         parent_xyz = coords_ds[parent, 1:].astype(np.float32)
@@ -830,25 +848,33 @@ def add_precision_divisions_post_ilp(
         family_candidates: list[dict] = []
 
         for candidate, raw_edge_prob in raw_by_parent.get(parent, []):
+            if trace:
+                print(f"[DIVTRACE CAND] parent={parent} candidate={candidate} raw_edge={raw_edge_prob:.6f}", flush=True)
             if candidate == existing or (parent, candidate) in edge_set:
+                if trace: print(f"[DIVTRACE REJECT] parent={parent} candidate={candidate} reason=already_existing_child_or_edge", flush=True)
                 continue
             if raw_edge_prob < config.division_min_edge_prob:
+                if trace: print(f"[DIVTRACE REJECT] parent={parent} candidate={candidate} reason=raw_edge_below_floor raw={raw_edge_prob:.6f} floor={config.division_min_edge_prob}", flush=True)
                 continue
             if int(coords_ds[candidate, 0]) != parent_time + 1:
+                if trace: print(f"[DIVTRACE REJECT] parent={parent} candidate={candidate} reason=wrong_time cand_t={int(coords_ds[candidate,0])} expected={parent_time+1}", flush=True)
                 continue
 
             candidate_node_id = global_to_node_id[int(candidate)]
             if candidate_node_id not in surviving_node_ids:
                 removed_by_ilp_count += 1
+                if trace: print(f"[DIVTRACE REJECT] parent={parent} candidate={candidate} reason=removed_by_ilp node_id={candidate_node_id}", flush=True)
                 continue
 
             # Candidate must survive ILP and be genuinely parent-free.
             if len(incoming_sources.get(candidate, [])) != 0:
+                if trace: print(f"[DIVTRACE REJECT] parent={parent} candidate={candidate} reason=candidate_already_claimed claims={incoming_sources.get(candidate, [])}", flush=True)
                 continue
 
             candidate_xyz = coords_ds[candidate, 1:].astype(np.float32)
             candidate_dist = physical_distance(parent_xyz, candidate_xyz, voxel_size_ds)
             if candidate_dist > config.division_parent_max_um:
+                if trace: print(f"[DIVTRACE REJECT] parent={parent} candidate={candidate} reason=parent_distance dist={candidate_dist:.6f} max={config.division_parent_max_um}", flush=True)
                 continue
 
             sister_dist = physical_distance(existing_xyz, candidate_xyz, voxel_size_ds)
@@ -857,16 +883,19 @@ def add_precision_divisions_post_ilp(
                 <= sister_dist
                 <= config.division_sister_max_um
             ):
+                if trace: print(f"[DIVTRACE REJECT] parent={parent} candidate={candidate} reason=sister_distance sister={sister_dist:.6f} range=[{config.division_sister_min_um},{config.division_sister_max_um}]", flush=True)
                 continue
 
             midpoint_xyz = 0.5 * (existing_xyz + candidate_xyz)
             midpoint_error = physical_distance(parent_xyz, midpoint_xyz, voxel_size_ds)
             if midpoint_error > config.division_midpoint_max_um:
+                if trace: print(f"[DIVTRACE REJECT] parent={parent} candidate={candidate} reason=midpoint midpoint={midpoint_error:.6f} max={config.division_midpoint_max_um}", flush=True)
                 continue
 
             d1 = float(existing_dist)
             d2 = float(candidate_dist)
             if max(d1, d2) <= 1e-8:
+                if trace: print(f"[DIVTRACE REJECT] parent={parent} candidate={candidate} reason=degenerate_geometry", flush=True)
                 continue
 
             pds = min(d1, d2) / max(d1, d2)
@@ -916,8 +945,18 @@ def add_precision_divisions_post_ilp(
                     "branches_separate": branches_separate,
                 }
             )
+            if trace:
+                print(
+                    f"[DIVTRACE PASS_GEOM] parent={parent} candidate={candidate} "
+                    f"raw={raw_edge_prob:.6f} parent_dist={candidate_dist:.6f} "
+                    f"sister={sister_dist:.6f} midpoint={midpoint_error:.6f} "
+                    f"angle={angle:.3f} pds={pds:.6f} pair={pair_score:.6f} "
+                    f"persist={existing_forward}/{candidate_forward} history={parent_history}",
+                    flush=True,
+                )
 
         if not family_candidates:
+            if trace: print(f"[DIVTRACE STOP] parent={parent} reason=no_family_candidates_after_generator_gates", flush=True)
             continue
 
         # V16.3.2 selection: neural evidence first, then require one of two
@@ -2088,6 +2127,13 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "--trace-division-parents",
+        type=str,
+        default="",
+        help="Diagnostic only: comma-separated global parent indices to trace through pre-audit division gates.",
+    )
+
+    parser.add_argument(
         "--max-link-distance-um",
         type=float,
         default=15.0,
@@ -2301,6 +2347,11 @@ def main() -> None:
         ilp_disappearance_weight=args.ilp_disappearance_weight,
         ilp_division_weight=args.ilp_division_weight,
         audit_csv=audit_csv,
+        trace_division_parents=tuple(
+            int(x.strip())
+            for x in args.trace_division_parents.split(",")
+            if x.strip()
+        ),
     )
 
     folds = (
