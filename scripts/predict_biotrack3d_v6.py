@@ -165,6 +165,11 @@ class PredictConfig:
 
     audit_csv: Path | None = None
 
+    # Diagnostic only: save every neural source->target pair within the normal
+    # physical link radius, including probabilities below edge_threshold.
+    # This does NOT change prediction/selection logic.
+    association_candidates_dir: Path | None = None
+
 
 _DEFAULT_CONFIG = {
     "unet_out_channels": 32,
@@ -1262,6 +1267,7 @@ def predict_video(
     dict[int, float],
     np.ndarray,
     list[dict],
+    dict[str, np.ndarray],
 ]:
     """Predict one complete video and return post-decoding rescue context."""
 
@@ -1335,6 +1341,15 @@ def predict_video(
     seen_pairs: set[tuple[int, int]] = set()
 
     audit_rows: list[dict] = []
+
+    # Association diagnostic cache. IDs are global detection indices here;
+    # predict() converts them to persistent graph node IDs before saving.
+    assoc_src_global: list[np.ndarray] = []
+    assoc_tgt_global: list[np.ndarray] = []
+    assoc_source_time: list[np.ndarray] = []
+    assoc_target_time: list[np.ndarray] = []
+    assoc_prob: list[np.ndarray] = []
+    assoc_dist_um: list[np.ndarray] = []
 
     stride = max(window_size - 1, 1)
 
@@ -1598,6 +1613,35 @@ def predict_video(
                     division_probabilities[source_local]
                 )
 
+            # Diagnostic cache: every pair inside the tracker's physical link
+            # radius, regardless of neural probability. Vectorized to avoid a
+            # second Python O(N*M) loop. This cache is read only by the offline
+            # association-miss analyzer and never affects predictions.
+            if config.association_candidates_dir is not None:
+                delta_um = (
+                    source_coords_ds[:, None, :]
+                    - target_coords_ds[None, :, :]
+                ) * voxel_size_ds[None, None, :]
+                distance_matrix_um = np.linalg.norm(delta_um, axis=2)
+                src_local_idx, tgt_local_idx = np.nonzero(
+                    distance_matrix_um <= config.max_link_distance_um
+                )
+                if len(src_local_idx):
+                    assoc_src_global.append(source_global[src_local_idx].astype(np.int64))
+                    assoc_tgt_global.append(target_global[tgt_local_idx].astype(np.int64))
+                    assoc_source_time.append(
+                        np.full(len(src_local_idx), source_time, dtype=np.int32)
+                    )
+                    assoc_target_time.append(
+                        np.full(len(src_local_idx), target_time, dtype=np.int32)
+                    )
+                    assoc_prob.append(
+                        edge_probabilities[src_local_idx, tgt_local_idx].astype(np.float32)
+                    )
+                    assoc_dist_um.append(
+                        distance_matrix_um[src_local_idx, tgt_local_idx].astype(np.float32)
+                    )
+
             # Save all plausible pair probabilities for later division completion.
             for source_local in range(n_source):
                 for target_local in range(n_target):
@@ -1676,6 +1720,33 @@ def predict_video(
     coords_original = coords_ds.copy()
     coords_original[:, 1:] *= downsample_array
 
+    association_candidate_cache = {
+        "source_global": (
+            np.concatenate(assoc_src_global).astype(np.int64, copy=False)
+            if assoc_src_global else np.empty(0, dtype=np.int64)
+        ),
+        "target_global": (
+            np.concatenate(assoc_tgt_global).astype(np.int64, copy=False)
+            if assoc_tgt_global else np.empty(0, dtype=np.int64)
+        ),
+        "source_time": (
+            np.concatenate(assoc_source_time).astype(np.int32, copy=False)
+            if assoc_source_time else np.empty(0, dtype=np.int32)
+        ),
+        "target_time": (
+            np.concatenate(assoc_target_time).astype(np.int32, copy=False)
+            if assoc_target_time else np.empty(0, dtype=np.int32)
+        ),
+        "prob": (
+            np.concatenate(assoc_prob).astype(np.float32, copy=False)
+            if assoc_prob else np.empty(0, dtype=np.float32)
+        ),
+        "dist_um": (
+            np.concatenate(assoc_dist_um).astype(np.float32, copy=False)
+            if assoc_dist_um else np.empty(0, dtype=np.float32)
+        ),
+    }
+
     return (
         coords_original,
         coords_ds,
@@ -1684,6 +1755,7 @@ def predict_video(
         division_head_by_global,
         voxel_size_ds,
         audit_rows,
+        association_candidate_cache,
     )
 
 
@@ -1886,6 +1958,7 @@ def predict(
             division_head_by_global,
             voxel_size_ds,
             audit_rows,
+            association_candidate_cache,
         ) = predict_video(
             model=model,
             dataset_path=dataset_path,
@@ -1907,6 +1980,49 @@ def predict(
             coords_original,
             edges,
         )
+
+        if config.association_candidates_dir is not None:
+            cache_dir = Path(config.association_candidates_dir)
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            sg = association_candidate_cache["source_global"]
+            tg = association_candidate_cache["target_global"]
+            preselected = {(int(a), int(b)) for a, b, _, _ in edges}
+            source_node_id = np.fromiter(
+                (int(node_ids[int(i)]) for i in sg),
+                dtype=np.int64,
+                count=len(sg),
+            )
+            target_node_id = np.fromiter(
+                (int(node_ids[int(i)]) for i in tg),
+                dtype=np.int64,
+                count=len(tg),
+            )
+            predecode_selected = np.fromiter(
+                ((int(a), int(b)) in preselected for a, b in zip(sg, tg, strict=True)),
+                dtype=np.bool_,
+                count=len(sg),
+            )
+            source_division_head = np.fromiter(
+                (float(division_head_by_global.get(int(i), np.nan)) for i in sg),
+                dtype=np.float32,
+                count=len(sg),
+            )
+            cache_path = cache_dir / f"{name}.npz"
+            np.savez_compressed(
+                cache_path,
+                source_id=source_node_id,
+                target_id=target_node_id,
+                source_time=association_candidate_cache["source_time"],
+                target_time=association_candidate_cache["target_time"],
+                prob=association_candidate_cache["prob"],
+                dist_um=association_candidate_cache["dist_um"],
+                predecode_selected=predecode_selected,
+                source_division_head=source_division_head,
+            )
+            print(
+                f"[ASSOC CACHE] {name}: pairs={len(source_node_id)} path={cache_path}",
+                flush=True,
+            )
 
         print(
             f"[PRE-ILP GRAPH] {name}: "
@@ -2268,6 +2384,17 @@ def main() -> None:
         help="Optional path for division candidate audit CSV.",
     )
 
+    parser.add_argument(
+        "--association-candidates-dir",
+        type=str,
+        default=None,
+        help=(
+            "Diagnostic only: directory for compressed NPZ caches containing "
+            "every neural source->target pair within max-link-distance, including "
+            "scores below edge-threshold. Prediction logic is unchanged."
+        ),
+    )
+
     args = parser.parse_args()
 
     from dataspec import DATASET_PATH
@@ -2320,6 +2447,12 @@ def main() -> None:
         else None
     )
 
+    association_candidates_dir = (
+        Path(args.association_candidates_dir)
+        if args.association_candidates_dir is not None
+        else None
+    )
+
     config = PredictConfig(
         det_threshold=args.det_threshold,
         det_tta=args.det_tta,
@@ -2348,6 +2481,7 @@ def main() -> None:
         ilp_disappearance_weight=args.ilp_disappearance_weight,
         ilp_division_weight=args.ilp_division_weight,
         audit_csv=audit_csv,
+        association_candidates_dir=association_candidates_dir,
     )
 
     folds = (
@@ -2358,7 +2492,7 @@ def main() -> None:
 
     for fold in folds:
         print(
-            "BioTrack3D++ V16.3.2: "
+            "BioTrack3D++ V16.4a association audit: "
             "strong V15 tracker + precision-first post-ILP division rescue",
             flush=True,
         )
