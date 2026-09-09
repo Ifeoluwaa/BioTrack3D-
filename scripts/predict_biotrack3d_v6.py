@@ -156,6 +156,11 @@ class PredictConfig:
     audit_csv: Path | None = None
     # Diagnostic only: global parent indices to trace through every pre-audit gate.
     trace_division_parents: tuple[int, ...] = ()
+    # Diagnostic only: exact (source_global,target_global) pairs whose neural edge
+    # probability is retained even when below division_min_edge_prob. This does
+    # not alter prediction logic because the normal generator still rejects
+    # below-floor edges.
+    trace_division_pairs: tuple[tuple[int, int], ...] = ()
 
 
 _DEFAULT_CONFIG = {
@@ -1323,6 +1328,9 @@ def predict_video(
 
     all_edges: list[tuple[int, int, float, float]] = []
     candidate_edges_by_pair: dict[tuple[int, int], float] = {}
+    trace_division_pair_set = {
+        (int(src), int(tgt)) for src, tgt in config.trace_division_pairs
+    }
     division_head_by_global: dict[int, float] = {}
 
     global_node_count = 0
@@ -1603,9 +1611,6 @@ def predict_video(
                         ]
                     )
 
-                    if probability < config.division_min_edge_prob:
-                        continue
-
                     source_global_id = int(
                         source_global[source_local]
                     )
@@ -1614,12 +1619,11 @@ def predict_video(
                         target_global[target_local]
                     )
 
-                    candidate_edges_by_pair[
-                        (
-                            source_global_id,
-                            target_global_id,
-                        )
-                    ] = probability
+                    pair_key = (source_global_id, target_global_id)
+                    if probability < config.division_min_edge_prob and pair_key not in trace_division_pair_set:
+                        continue
+
+                    candidate_edges_by_pair[pair_key] = probability
 
             if config.association_mode == "global":
                 normal_edges = build_global_associations(
@@ -2134,6 +2138,17 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "--trace-division-pairs",
+        type=str,
+        default="",
+        help=(
+            "Diagnostic only: comma-separated source:target global-index pairs, "
+            "e.g. 8194:8284,8508:8612. Exact neural probabilities are retained "
+            "for tracing even when below the normal division edge floor."
+        ),
+    )
+
+    parser.add_argument(
         "--max-link-distance-um",
         type=float,
         default=15.0,
@@ -2351,6 +2366,11 @@ def main() -> None:
             int(x.strip())
             for x in args.trace_division_parents.split(",")
             if x.strip()
+        ),
+        trace_division_pairs=tuple(
+            tuple(int(v.strip()) for v in item.split(":", 1))
+            for item in args.trace_division_pairs.split(",")
+            if item.strip()
         ),
     )
 
