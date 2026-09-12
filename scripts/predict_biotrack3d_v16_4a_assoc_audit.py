@@ -2097,6 +2097,34 @@ def predict(
             flush=True,
         )
 
+        # Historical V16.4a production graphs contain only detections that
+        # participate in at least one final tracking edge. Keep the complete
+        # detection universe above for association-candidate caching and
+        # division rescue, then prune degree-0 nodes only at serialization.
+        incident_node_ids: set[int] = set()
+        if graph.num_edges() > 0:
+            for row in graph.edge_attrs().iter_rows(named=True):
+                incident_node_ids.add(int(row["source_id"]))
+                incident_node_ids.add(int(row["target_id"]))
+
+        isolated_node_ids = [
+            int(node_id)
+            for node_id in graph.node_ids()
+            if int(node_id) not in incident_node_ids
+        ]
+
+        nodes_before_prune = graph.num_nodes()
+        if isolated_node_ids:
+            graph.bulk_remove_nodes(isolated_node_ids)
+
+        print(
+            f"[FINAL NODE PRUNE] {name}: "
+            f"removed={len(isolated_node_ids)} "
+            f"nodes={nodes_before_prune}->{graph.num_nodes()} "
+            f"edges={graph.num_edges()}",
+            flush=True,
+        )
+
         output_path = output_dir / f"{name}.geff"
         save_graph(graph, output_path)
 
