@@ -1,0 +1,19 @@
+{
+  "unet_out_channels": 32,
+  "unet_layers": [
+    32,
+    64,
+    128
+  ],
+  "downsample": [
+    1,
+    4,
+    4
+  ],
+  "window_size": 2,
+  "pool_kernel_um": 5.0,
+  "pooling_mode": "single_voxel",
+  "pool_radius": 0,
+  "pool_sigma": null,
+  "attn_dim": null
+}
